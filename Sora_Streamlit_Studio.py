@@ -214,8 +214,7 @@ def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
     if not files: st.warning("No files to stitch."); return None
     if not check_ffmpeg(): st.error("ffmpeg not found in PATH."); return None
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as tf:
-        for f in files: tf.write(f"file '{f.as_posix()})'
-"); tf.flush(); concat_list=tf.name
+        for f in files: tf.write(f"file '{f.as_posix()}'"); tf.flush(); concat_list=tf.name
     try:
         subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat_list,"-c","copy",out_path.as_posix(),"-y"], check=True)
         return out_path
