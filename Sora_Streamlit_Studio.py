@@ -220,19 +220,45 @@ def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
         return out_path
     except Exception as e: st.error(f"Stitch failed: {e}"); return None
 
-def render_multi_prompt_inputs(n: int) -> List[str]:
-    prompts: List[str] = []
-    cols_per_row = 2
-    idx = 0
+def render_multi_prompt_inputs(
+    n: int,
+    *,
+    cols_per_row: int = 2,
+    key_prefix: str = "multi_prompt_",
+    gap: str = "small",
+    height: int = 120,
+    placeholder: str = "Describe your video..."
+) -> list[str]:
+    """Render N prompt textareas in rows of `cols_per_row`, labeled Prompt #1..#N.
+    Uses top-aligned columns (if supported) to avoid uneven spacing."""
+    prompts: list[str] = []
+
+    # Detect Streamlit support for vertical_alignment (newer versions)
+    supports_va = "vertical_alignment" in inspect.signature(st.columns).parameters
+
     total_rows = math.ceil(n / cols_per_row)
-    for _ in range(total_rows):
-        row_cols = st.columns(cols_per_row, gap="large")
-        for c in range(cols_per_row):
-            if idx >= n:
-                break
-            with row_cols[c]:
-                prompts.append(st.text_area(f"Prompt #{idx+1}", height=120, key=f"multi_prompt_{idx}"))
-            idx += 1
+    for row in range(total_rows):
+        kwargs = {"gap": gap}
+        if supports_va:
+            kwargs["vertical_alignment"] = "top"
+        cols = st.columns(cols_per_row, **kwargs)
+
+        for col_idx in range(cols_per_row):
+            i = row * cols_per_row + col_idx
+            with cols[col_idx]:
+                if i >= n:
+                    # keep empty column so the row heights match
+                    st.empty()
+                else:
+                    prompts.append(
+                        st.text_area(
+                            f"Prompt #{i+1}",
+                            key=f"{key_prefix}{i}",
+                            height=height,
+                            placeholder=placeholder,
+                            label_visibility="visible",
+                        )
+                    )
     return prompts
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
@@ -348,7 +374,7 @@ with tabs[1]:
     if st.session_state.budget_enabled and (spent + m_est_cost) > st.session_state.budget_limit:
         st.warning(f"This run (~${m_est_cost:.2f}) may exceed your remaining budget.")
     st.write("Prompts")
-    multi_prompts: List[str] = render_multi_prompt_inputs(int(n))
+    multi_prompts = render_multi_prompt_inputs(int(n))
     st.write("References (optional)")
     m_gen_ref_prompt=st.text_input("Generate a shared reference image from prompt (optional)", key="multi_ref_gen")
     m_ref_uploaded=st.file_uploader("Or upload reference image(s) shared by all jobs", type=["png","jpg","jpeg"], accept_multiple_files=True, key="multi_ref_upload")
