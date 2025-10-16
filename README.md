@@ -398,6 +398,8 @@ If this saved you time (or a shoot 👀), you can fuel more dev with a small tip
 
 - **Bitcoin (BTC):** `bc1qpav33sclt900r2q4q9y6vuewftx22jx0xun0pe`
 - **Ethereum (ETH):** `0x27d1FC34b431Aa9c80d5F9EE7464c03Eb1D15be0`
+- **USDT (ETH Network):**
+`0x27d1FC34b431Aa9c80d5F9EE7464c03Eb1D15be0`
 
 Thanks a ton! 🙏
 
