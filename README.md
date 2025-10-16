@@ -1,6 +1,6 @@
 # Sora Streamlit Studio
 
-_An end-to-end Streamlit app for creating videos with OpenAI’s Sora API — featuring reference images, prompt enhancement, single/multiple/concurrent generation, remix sequences, a rate-limit aware batch queue, and budget guardrails with a live “remaining budget” meter. It also includes download buttons for generated assets, optional FFmpeg stitching for multi-clip sequences, and one-click zip export of your session outputs._
+_An end-to-end Streamlit app for creating watermark-free videos with OpenAI’s Sora API — featuring reference images, prompt enhancement, single/multiple/concurrent generation, remix sequences, a rate-limit aware batch queue, and budget guardrails with a live “remaining budget” meter. It also includes download buttons for generated assets, optional FFmpeg stitching for multi-clip sequences, and one-click zip export of your session outputs._
 
 **Heads-up:** The app is designed to be future-compatible. It uses a duration slider (1–60s) and a “Strict supported durations” toggle. When strict mode is on, your choice snaps to currently supported values (e.g., 4/8/12) to avoid API errors. You can turn strict mode off to try new durations as they become available.
 
