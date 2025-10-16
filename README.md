@@ -84,7 +84,7 @@ _An end-to-end Streamlit app for creating watermark-free videos with OpenAI’s 
 1. **Clone and install:**
 
 ```bash
-git clone https://github.com/<you>/sora-streamlit-studio.git
+git clone https://github.com/Dzechy/sora-streamlit-studio.git
 cd sora-streamlit-studio
 
 # Minimal deps
