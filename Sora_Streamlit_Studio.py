@@ -1,10 +1,9 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Streamlit Sora App — Budget, Rate-Limits, Batch Queue, Duration Slider
+Streamlit Sora App — Budget, Rate-Limits, Batch Queue, Duration Slider (patched Multiple tab layout)
 """
-import os, io, time, base64, tempfile, shutil, subprocess, threading
+import os, io, time, base64, tempfile, shutil, subprocess, threading, math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Any, Dict
@@ -41,9 +40,7 @@ def pil_save_image(b64_png: str, out: Path, size: Tuple[int, int] | None = (720,
         ensure_dir(out.parent); img.save(out); return out
     except Exception: return None
 
-def check_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
-
+def check_ffmpeg() -> bool: return shutil.which("ffmpeg") is not None
 def price_rate(model: str) -> float: return PRICE_PER_SECOND.get(model, 0.10)
 def estimate_cost(num_videos: int, seconds: int, model: str) -> float: return num_videos * seconds * price_rate(model)
 
@@ -76,7 +73,7 @@ class RateLimiter:
                 wait_s = max(0.1, 60.0 - (time.monotonic() - self.last_refill))
             time.sleep(wait_s)
 
-def get_rate_limiter() -> Optional[RateLimiter]: return st.session_state.get("rate_limiter")
+def get_rate_limiter() -> Optional['RateLimiter']: return st.session_state.get("rate_limiter")
 def rl_acquire(n: int = 1): rl = get_rate_limiter(); rl and rl.acquire(n)
 
 def init_openai_client(api_key: Optional[str]) -> Optional[OpenAI]:
@@ -217,13 +214,28 @@ def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
     if not files: st.warning("No files to stitch."); return None
     if not check_ffmpeg(): st.error("ffmpeg not found in PATH."); return None
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as tf:
-        for f in files: tf.write(f"file '{f.as_posix()}'\n"); tf.flush(); concat_list=tf.name
+        for f in files: tf.write(f"file '{f.as_posix()}'
+"); tf.flush(); concat_list=tf.name
     try:
         subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i",concat_list,"-c","copy",out_path.as_posix(),"-y"], check=True)
         return out_path
     except Exception as e: st.error(f"Stitch failed: {e}"); return None
 
-# ---------------- UI ----------------
+def render_multi_prompt_inputs(n: int) -> List[str]:
+    prompts: List[str] = []
+    cols_per_row = 2
+    idx = 0
+    total_rows = math.ceil(n / cols_per_row)
+    for _ in range(total_rows):
+        row_cols = st.columns(cols_per_row, gap="large")
+        for c in range(cols_per_row):
+            if idx >= n:
+                break
+            with row_cols[c]:
+                prompts.append(st.text_area(f"Prompt #{idx+1}", height=120, key=f"multi_prompt_{idx}"))
+            idx += 1
+    return prompts
+
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.title(APP_NAME)
 st.caption("Web UI for Sora video generation with prompt enhancement, references, multi-gen concurrency, remix, batch queue, and budget/rate-limit guardrails.")
@@ -337,11 +349,7 @@ with tabs[1]:
     if st.session_state.budget_enabled and (spent + m_est_cost) > st.session_state.budget_limit:
         st.warning(f"This run (~${m_est_cost:.2f}) may exceed your remaining budget.")
     st.write("Prompts")
-    multi_prompts: List[str]=[]
-    cols=st.columns(2)
-    for i in range(int(n)):
-        with cols[i%2]:
-            p=st.text_area(f"Prompt #{i+1}", height=120, key=f"multi_prompt_{i}"); multi_prompts.append(p)
+    multi_prompts: List[str] = render_multi_prompt_inputs(int(n))
     st.write("References (optional)")
     m_gen_ref_prompt=st.text_input("Generate a shared reference image from prompt (optional)", key="multi_ref_gen")
     m_ref_uploaded=st.file_uploader("Or upload reference image(s) shared by all jobs", type=["png","jpg","jpeg"], accept_multiple_files=True, key="multi_ref_upload")
@@ -357,7 +365,7 @@ with tabs[1]:
                 p=refs_dir/f"shared_upload_{i}.png"; write_bytes(p, uf.getvalue()); refs.append(p)
         jobs: List[GenJob]=[]
         for i,p in enumerate(multi_prompts):
-            if not p.strip(): continue
+            if not p or not p.strip(): continue
             enhanced_txt=enhance_prompt(client, p, enhance_style) if use_enhance else None
             jobs.append(GenJob(idx=i, prompt=p, enhanced_prompt=enhanced_txt, references=refs))
         if not jobs: st.warning("Please enter at least one prompt.")
