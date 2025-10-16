@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Sora Streamlit Studio — Budget, Rate-Limits, Batch Queue, Duration Slider
+Includes:
+ - Images API patch for generating reference images
+ - Multiple-upload workaround: auto-combine refs into a single montage
+ - Configurable montage layout (Auto, 1×N, N×1, 2×2, 3×2, 3×3, 3×N, Custom)
+ - Multiple tab fix: row-wise, top-aligned prompt inputs
 """
 import os
 import io
@@ -19,9 +24,9 @@ from typing import Callable, List, Optional, Tuple, Any, Dict
 
 import streamlit as st
 
-# Optional Pillow for saving generated refs
+# Optional Pillow for image I/O and montage
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except Exception:
     Image = None  # type: ignore
 
@@ -34,7 +39,7 @@ except Exception:
 APP_NAME = "Sora Streamlit Studio"
 DEFAULT_OUTPUT_DIR = Path("outputs")
 
-# Pricing used for the estimator (update if your plan changes)
+# Pricing used for the estimator (update to match your plan)
 PRICE_PER_SECOND = {
     "sora-2": 0.10,
     "sora-2-pro": 0.30,
@@ -66,14 +71,32 @@ def write_bytes(path: Path, data: bytes) -> Path:
     path.write_bytes(data)
     return path
 
-def pil_save_image(b64_png: str, out: Path, size: Tuple[int, int] | None = (720, 1280)) -> Optional[Path]:
+def parse_size(size_str: str, fallback: Tuple[int, int] = (720, 1280)) -> Tuple[int, int]:
+    try:
+        w, h = size_str.lower().split("x")
+        return int(w), int(h)
+    except Exception:
+        return fallback
+
+def pil_resize_letterbox(img: "Image.Image", canvas_size: Tuple[int, int]) -> "Image.Image":
+    """Resize image to fit inside canvas_size with letterboxing (no distortion)."""
+    cw, ch = canvas_size
+    canvas = Image.new("RGB", (cw, ch), color=(0, 0, 0))
+    thumb = ImageOps.contain(img, (cw, ch))
+    ox = (cw - thumb.width) // 2
+    oy = (ch - thumb.height) // 2
+    canvas.paste(thumb, (ox, oy))
+    return canvas
+
+def pil_save_image(b64_png: str, out: Path, size: Tuple[int, int] | None = (720, 1280), letterbox: bool = True) -> Optional[Path]:
+    """Save a base64 image to file, optionally resizing/letterboxing to target canvas size."""
     try:
         raw = base64.b64decode(b64_png)
         if Image is None:
             return write_bytes(out, raw)
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         if size:
-            img = img.resize(size)
+            img = pil_resize_letterbox(img, size) if letterbox else img.resize(size)
         ensure_dir(out.parent)
         img.save(out)
         return out
@@ -200,7 +223,7 @@ def call_api_with_rl(fn: Callable[[], Any]) -> Any:
     return with_retries(fn, attempts=2)
 
 # -------------------------
-# Poll & Download, Prompt Enhance, Reference Image
+# Poll & Download, Prompt Enhance
 # -------------------------
 
 def poll_and_download_video(client: OpenAI, video, out_dir: Path, name_prefix: str, seconds: int, model: str) -> Tuple[Optional[Path], Optional[str]]:
@@ -252,31 +275,163 @@ def enhance_prompt(client: OpenAI, prompt: str, style: str = "director") -> str:
         st.warning(f"Enhancement failed, using original prompt. ({e})")
         return prompt
 
-def make_reference_image(client: OpenAI, text: str, out_dir: Path, name: str) -> Optional[Path]:
+# -------------------------
+# Reference Images
+# -------------------------
+
+def make_reference_image(client: OpenAI, text: str, out_dir: Path, name: str, canvas_size: Tuple[int, int] = (720, 1280)) -> Optional[Path]:
+    """
+    Generate a reference image via Images API (gpt-image-1). The Images API typically
+    returns square sizes (e.g., 1024x1024). We then letterbox to the desired canvas.
+    """
     try:
-        resp = call_api_with_rl(lambda: OpenAI().responses.create(model="gpt-image-1", input=text))
-        b64 = None
-        for path in [
-            ("output", 0, "content", 0, "image_base64"),
-            ("content", 0, "image_base64"),
-        ]:
-            try:
-                r = resp
-                for key in path:
-                    r = r[key] if isinstance(key, int) else getattr(r, key)
-                if isinstance(r, str):
-                    b64 = r
-                    break
-            except Exception:
-                continue
-        if not b64:
-            st.error("Could not extract image from API response.")
-            return None
+        resp = call_api_with_rl(lambda: client.images.generate(
+            model="gpt-image-1",
+            prompt=text,
+            size="1024x1024"
+        ))
+        b64 = resp.data[0].b64_json
         out_path = out_dir / f"{name}.png"
-        return pil_save_image(b64, out_path, (720, 1280))
+        return pil_save_image(b64, out_path, size=canvas_size, letterbox=True)
     except Exception as e:
         st.error(f"Reference image generation failed: {e}")
         return None
+
+def _decide_grid(n: int, layout_mode: str, custom_cols: Optional[int], custom_rows: Optional[int]) -> Tuple[int, int]:
+    """Return (cols, rows) according to the layout strategy."""
+    if layout_mode == "Auto":
+        if n <= 2:
+            return (1, 2)
+        elif n <= 4:
+            return (2, 2)
+        elif n <= 6:
+            return (3, 2)
+        elif n <= 9:
+            return (3, 3)
+        else:
+            cols = 3
+            rows = math.ceil(n / cols)
+            return (cols, rows)
+    if layout_mode == "1×N (vertical stack)":
+        return (1, n)
+    if layout_mode == "N×1 (horizontal strip)":
+        return (n, 1)
+    if layout_mode == "2×2 grid":
+        return (2, 2)
+    if layout_mode == "3×2 grid":
+        return (3, 2)
+    if layout_mode == "3×3 grid":
+        return (3, 3)
+    if layout_mode == "3×N (3 cols, rows as needed)":
+        cols = 3
+        rows = math.ceil(n / cols)
+        return (cols, rows)
+    # Custom
+    c = max(1, int(custom_cols or 1))
+    r = max(1, int(custom_rows or 1))
+    return (c, r)
+
+def combine_reference_images(
+    paths: List[Path],
+    out_path: Path,
+    canvas_size: Tuple[int, int],
+    *,
+    layout_mode: str = "Auto",
+    custom_cols: Optional[int] = None,
+    custom_rows: Optional[int] = None,
+    padding: int = 0,
+    bg_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Optional[Path]:
+    """
+    Combine multiple reference images into a single contact-sheet (montage),
+    letterboxed per cell, to produce one reference compatible with Sora.
+
+    If more images are uploaded than fit into the chosen grid, the overflow
+    is truncated with a warning (first K images are used).
+    """
+    if not paths:
+        return None
+    if len(paths) == 1:
+        return paths[0]
+
+    if Image is None:
+        st.warning("Pillow is not installed; using only the first uploaded reference.")
+        return paths[0]
+
+    cw, ch = canvas_size
+    cols, rows = _decide_grid(len(paths), layout_mode, custom_cols, custom_rows)
+    capacity = cols * rows
+    imgs = paths[:capacity]
+    if len(paths) > capacity:
+        st.warning(f"Montage capacity is {capacity} cells ({cols}×{rows}). Using the first {capacity} image(s) out of {len(paths)}.")
+
+    # Compute inner area with uniform padding (gutter + outer margin)
+    p = max(0, int(padding))
+    inner_w = max(1, cw - (cols + 1) * p)
+    inner_h = max(1, ch - (rows + 1) * p)
+    cell_w = max(1, inner_w // cols)
+    cell_h = max(1, inner_h // rows)
+
+    sheet = Image.new("RGB", (cw, ch), color=bg_color)
+
+    def load_img(pth: Path) -> Optional["Image.Image"]:
+        try:
+            im = Image.open(pth).convert("RGB")
+            return im
+        except Exception:
+            return None
+
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            if idx >= len(imgs):
+                break
+            im = load_img(imgs[idx])
+            idx += 1
+            if im is None:
+                continue
+            thumb = ImageOps.contain(im, (cell_w, cell_h))
+            x = p + c * (cell_w + p)
+            y = p + r * (cell_h + p)
+            # center within the cell rect (x..x+cell_w, y..y+cell_h)
+            ox = x + (cell_w - thumb.width) // 2
+            oy = y + (cell_h - thumb.height) // 2
+            sheet.paste(thumb, (ox, oy))
+
+    ensure_dir(out_path.parent)
+    sheet.save(out_path)
+    return out_path
+
+def build_single_reference(
+    ref_paths: List[Path],
+    out_root: Path,
+    canvas_size: Tuple[int, int],
+    *,
+    montage_layout: str = "Auto",
+    montage_cols: Optional[int] = None,
+    montage_rows: Optional[int] = None,
+    montage_padding: int = 0,
+) -> Optional[Path]:
+    """
+    Returns a single Path to pass to Sora:
+      - No refs → None
+      - One ref → that ref
+      - Multiple refs → combine into a montage (if Pillow available), else use first
+    """
+    if not ref_paths:
+        return None
+    if len(ref_paths) == 1:
+        return ref_paths[0]
+    combined = out_root / "refs" / f"combined_{int(time.time())}.png"
+    return combine_reference_images(
+        ref_paths,
+        combined,
+        canvas_size,
+        layout_mode=montage_layout,
+        custom_cols=montage_cols,
+        custom_rows=montage_rows,
+        padding=montage_padding,
+    )
 
 # -------------------------
 # Data models & Flows
@@ -370,7 +525,7 @@ def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
         return None
 
 # -------------------------
-# UI Helper — Multiple tab
+# UI Helper — Multiple tab prompt layout (row-wise)
 # -------------------------
 
 def render_multi_prompt_inputs(
@@ -385,10 +540,7 @@ def render_multi_prompt_inputs(
     """Render N prompt textareas in rows of `cols_per_row`, labeled Prompt #1..#N.
     Uses top-aligned columns (if supported) to avoid uneven spacing."""
     prompts: List[str] = []
-
-    # Detect Streamlit support for vertical_alignment (newer versions)
     supports_va = "vertical_alignment" in inspect.signature(st.columns).parameters
-
     total_rows = math.ceil(n / cols_per_row)
     idx = 0
     for _ in range(total_rows):
@@ -398,7 +550,6 @@ def render_multi_prompt_inputs(
         cols = st.columns(cols_per_row, **kwargs)
         for c in range(cols_per_row):
             if idx >= n:
-                # Keep an empty cell so row heights match
                 with cols[c]:
                     st.empty()
                 continue
@@ -431,12 +582,13 @@ with st.sidebar:
 
     # Duration slider + strict snapping
     seconds_slider = st.slider("Duration (seconds)", min_value=1, max_value=60, value=4, step=1)
-    strict_durations = st.checkbox("Strict supported durations", value=True, help="When on, snaps to currently-supported values to avoid API errors.")
+    strict_durations = st.checkbox("Strict supported durations", value=True, help="When on, snaps to commonly supported values to avoid API errors.")
     st.caption(f"Currently supported durations: {', '.join(map(str, CURRENT_SUPPORTED_DURATIONS))} seconds.")
     seconds = min(CURRENT_SUPPORTED_DURATIONS, key=lambda x: abs(x - seconds_slider)) if strict_durations else seconds_slider
 
     size_choice = st.selectbox("Frame Size", ["720x1280 (portrait)", "1280x720 (landscape)", "Custom"], index=0)
     size = st.text_input("Custom size (e.g., 720x1280)", "720x1280") if size_choice == "Custom" else size_choice.split()[0]
+    canvas_w, canvas_h = parse_size(size)
 
     # Rate-limit tier → token bucket
     tier = st.selectbox("Rate limit tier", list(RPM_TIERS.keys()), index=1)
@@ -448,6 +600,23 @@ with st.sidebar:
     st.subheader("Prompt Enhancement")
     use_enhance = st.checkbox("Enhance prompts before generating", value=False)
     enhance_style = st.selectbox("Enhancement style", ["director", "pixar", "clean"], index=0)
+
+    # Reference montage configuration
+    st.subheader("Reference Montage (for multiple uploads)")
+    st.caption("Sora currently uses a single reference per job. If you upload multiple images, the app combines them into one montage according to these settings.")
+    montage_layout = st.selectbox(
+        "Montage layout",
+        ["Auto", "1×N (vertical stack)", "N×1 (horizontal strip)", "2×2 grid", "3×2 grid", "3×3 grid", "3×N (3 cols, rows as needed)", "Custom"],
+        index=0,
+        help="Auto chooses a grid to fit your count (1×2, 2×2, 3×2, 3×3, or 3×N). For Custom, set columns/rows below."
+    )
+    col_m1, col_m2, col_m3 = st.columns([1,1,1])
+    with col_m1:
+        montage_padding = st.number_input("Padding (px)", min_value=0, max_value=40, value=0, step=1)
+    with col_m2:
+        montage_cols = st.number_input("Custom columns", min_value=1, max_value=8, value=3, step=1, disabled=(montage_layout != "Custom"))
+    with col_m3:
+        montage_rows = st.number_input("Custom rows", min_value=1, max_value=8, value=2, step=1, disabled=(montage_layout != "Custom"))
 
     # Budget
     init_budget_state()
@@ -518,6 +687,7 @@ with tabs[0]:
     with colA:
         user_prompt = st.text_area("Prompt", height=150, placeholder="Describe your video...")
         gen_refs_from_prompt = st.text_input("Optional: Generate reference image from a prompt (leave blank to skip)")
+        st.caption("Note: Sora uses only one reference image. If you upload multiple, we'll combine them into a single montage based on the settings in the sidebar.")
         ref_uploaded = st.file_uploader("Or upload reference image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
         est_cost = estimate_cost(1, seconds, model)
@@ -532,32 +702,48 @@ with tabs[0]:
             if st.session_state.budget_enabled and (spent + est_cost) > st.session_state.budget_limit:
                 st.stop()
 
-            # Build references
             refs: List[Path] = []
+            # Generate a reference from prompt if present
             if gen_refs_from_prompt.strip():
-                out_img = make_reference_image(client, gen_refs_from_prompt, st.session_state.output_dir / "refs", "ref_1")
+                out_img = make_reference_image(
+                    client, gen_refs_from_prompt,
+                    st.session_state.output_dir / "refs", "ref_1",
+                    canvas_size=(canvas_w, canvas_h)
+                )
                 if out_img:
                     refs.append(out_img)
                     st.image(str(out_img), caption="Generated reference", use_container_width=True)
+
+            # Uploaded images → save to disk
             if ref_uploaded:
                 refs_dir = ensure_dir(st.session_state.output_dir / "refs")
                 for i, uf in enumerate(ref_uploaded, start=1):
                     p = refs_dir / f"upload_{i}.png"
                     write_bytes(p, uf.getvalue())
                     refs.append(p)
-                if refs:
-                    st.success(f"Loaded {len(refs)} reference image(s).")
-                    st.image([str(x) for x in refs], caption=[x.name for x in refs])
 
-            # Enhance
+            # Combine multiple refs into a single image per UI layout
+            single_ref_path = build_single_reference(
+                refs, st.session_state.output_dir, (canvas_w, canvas_h),
+                montage_layout=montage_layout,
+                montage_cols=int(montage_cols),
+                montage_rows=int(montage_rows),
+                montage_padding=int(montage_padding),
+            )
+            refs = [single_ref_path] if single_ref_path else []
+
+            if refs:
+                st.success("Using 1 reference image.")
+                st.image(str(refs[0]), caption=Path(refs[0]).name, use_container_width=True)
+
             final_prompt = user_prompt
             enhanced_txt = None
             if use_enhance and user_prompt.strip():
                 enhanced_txt = enhance_prompt(client, user_prompt, enhance_style)
                 final_prompt = enhanced_txt
 
-            if not user_prompt.strip() and not gen_refs_from_prompt.strip():
-                st.warning("Please provide at least a video prompt, or generate a reference image prompt.")
+            if not user_prompt.strip() and not gen_refs_from_prompt.strip() and not ref_uploaded:
+                st.warning("Please provide a video prompt or a reference image prompt or upload a reference image.")
             else:
                 try:
                     with st.spinner("Generating video..."):
@@ -577,7 +763,8 @@ with tabs[1]:
     st.subheader("Multiple / Concurrent Generation")
     n = st.number_input("Number of generations", min_value=2, max_value=24, value=3, step=1)
     workers = st.number_input("Concurrent workers", min_value=1, max_value=24, value=2, step=1)
-    st.caption("We run up to 'Concurrent workers' jobs in parallel; rate limiter still gates calls globally.")
+    st.caption("We run up to 'Concurrent workers' jobs in parallel; the token-bucket limiter still gates API calls globally.")
+    st.caption("Note: Sora uses a single reference per job. If you upload multiple, we'll combine them into one montage based on the settings in the sidebar.")
 
     m_est_cost = estimate_cost(int(n), seconds, model)
     m_calls_per_job = 1 + (1 if use_enhance else 0)
@@ -588,7 +775,6 @@ with tabs[1]:
         st.warning(f"This run (~${m_est_cost:.2f}) may exceed your remaining budget.")
 
     st.write("Prompts")
-    # FIRST FIX: row-wise, top-aligned prompt inputs with stable keys
     multi_prompts: List[str] = render_multi_prompt_inputs(int(n))
 
     st.write("References (optional)")
@@ -599,13 +785,15 @@ with tabs[1]:
         if st.session_state.budget_enabled and (spent + m_est_cost) > st.session_state.budget_limit:
             st.stop()
 
-        # Shared references
         refs: List[Path] = []
         if m_gen_ref_prompt.strip():
-            out_img = make_reference_image(client, m_gen_ref_prompt, st.session_state.output_dir / "refs", "shared_ref")
+            out_img = make_reference_image(
+                client, m_gen_ref_prompt,
+                st.session_state.output_dir / "refs", "shared_ref",
+                canvas_size=(canvas_w, canvas_h)
+            )
             if out_img:
                 refs.append(out_img)
-                st.image(str(out_img), caption="Generated shared reference", use_container_width=True)
         if m_ref_uploaded:
             refs_dir = ensure_dir(st.session_state.output_dir / "refs")
             for i, uf in enumerate(m_ref_uploaded, start=1):
@@ -613,7 +801,18 @@ with tabs[1]:
                 write_bytes(p, uf.getvalue())
                 refs.append(p)
 
-        # Build jobs
+        single_ref_path = build_single_reference(
+            refs, st.session_state.output_dir, (canvas_w, canvas_h),
+            montage_layout=montage_layout,
+            montage_cols=int(montage_cols),
+            montage_rows=int(montage_rows),
+            montage_padding=int(montage_padding),
+        )
+        refs = [single_ref_path] if single_ref_path else []
+
+        if refs:
+            st.image(str(refs[0]), caption=f"Shared reference used: {Path(refs[0]).name}", use_container_width=True)
+
         jobs: List[GenJob] = []
         for i, ptxt in enumerate(multi_prompts):
             if not ptxt or not ptxt.strip():
@@ -656,6 +855,7 @@ with tabs[2]:
         st.warning(f"This remix run (~${r_cost:.2f}) may exceed your remaining budget.")
 
     rr_gen_refs_from_prompt = st.text_input("Optional: Generate reference image from a prompt (for base shot)")
+    st.caption("Note: Sora uses a single reference for the base shot. If you upload multiple, we'll combine them into one montage per the sidebar settings.")
     rr_ref_uploaded = st.file_uploader("Or upload reference image(s) for base shot", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="remix_refs")
 
     if client and st.button("Generate Remix Sequence"):
@@ -667,16 +867,31 @@ with tabs[2]:
         else:
             refs: List[Path] = []
             if rr_gen_refs_from_prompt.strip():
-                out_img = make_reference_image(client, rr_gen_refs_from_prompt, st.session_state.output_dir / "refs", "remix_base_ref")
+                out_img = make_reference_image(
+                    client, rr_gen_refs_from_prompt,
+                    st.session_state.output_dir / "refs", "remix_base_ref",
+                    canvas_size=(canvas_w, canvas_h)
+                )
                 if out_img:
                     refs.append(out_img)
-                    st.image(str(out_img), caption="Generated reference for base", use_container_width=True)
             if rr_ref_uploaded:
                 refs_dir = ensure_dir(st.session_state.output_dir / "refs")
                 for i, uf in enumerate(rr_ref_uploaded, start=1):
                     p = refs_dir / f"remix_upload_{i}.png"
                     write_bytes(p, uf.getvalue())
                     refs.append(p)
+
+            single_ref_path = build_single_reference(
+                refs, st.session_state.output_dir, (canvas_w, canvas_h),
+                montage_layout=montage_layout,
+                montage_cols=int(montage_cols),
+                montage_rows=int(montage_rows),
+                montage_padding=int(montage_padding),
+            )
+            refs = [single_ref_path] if single_ref_path else []
+
+            if refs:
+                st.image(str(refs[0]), caption="Reference used for base", use_container_width=True)
 
             base_final = enhance_prompt(client, base_prompt, enhance_style) if use_enhance else base_prompt
             remix_final = [enhance_prompt(client, rp, enhance_style) if use_enhance else rp for rp in remix_prompts]
@@ -706,6 +921,7 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Batch Queue (Rate-limit aware)")
     st.caption("Queue jobs and let the token-bucket limiter handle pacing (auto-pauses when tokens deplete, resumes after refill).")
+    st.caption("Note: One reference is used per job. If you upload multiple, we'll combine into a montage using the sidebar layout settings.")
 
     if "batch_jobs" not in st.session_state:
         st.session_state.batch_jobs = []  # {'prompt': str, 'status': 'queued|running|done|error', 'path': Optional[Path]}
@@ -742,16 +958,31 @@ with tabs[3]:
         # Build shared refs
         refs: List[Path] = []
         if b_gen_ref_prompt.strip():
-            out_img = make_reference_image(client, b_gen_ref_prompt, st.session_state.output_dir / "refs", "batch_shared_ref")
+            out_img = make_reference_image(
+                client, b_gen_ref_prompt,
+                st.session_state.output_dir / "refs", "batch_shared_ref",
+                canvas_size=(canvas_w, canvas_h)
+            )
             if out_img:
                 refs.append(out_img)
-                st.image(str(out_img), caption="Generated shared reference", use_container_width=True)
         if b_ref_uploaded:
             refs_dir = ensure_dir(st.session_state.output_dir / "refs")
             for i, uf in enumerate(b_ref_uploaded, start=1):
                 p = refs_dir / f"batch_upload_{i}.png"
                 write_bytes(p, uf.getvalue())
                 refs.append(p)
+
+        single_ref_path = build_single_reference(
+            refs, st.session_state.output_dir, (canvas_w, canvas_h),
+            montage_layout=montage_layout,
+            montage_cols=int(montage_cols),
+            montage_rows=int(montage_rows),
+            montage_padding=int(montage_padding),
+        )
+        refs = [single_ref_path] if single_ref_path else []
+
+        if refs:
+            st.image(str(refs[0]), caption="Shared reference used for batch", use_container_width=True)
 
         completed = 0
         for job in st.session_state.batch_jobs:
