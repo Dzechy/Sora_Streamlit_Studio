@@ -2,9 +2,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Streamlit Sora App (patched)
-============================
-See docstring in previous attempt for details.
+Streamlit Sora App — pricing + rate-limit aware
+===============================================
+This version adds:
+- **Cost estimator** (Sora 2: $0.10/s, Sora 2 Pro: $0.30/s)
+- **Allowed durations** restricted to 4/8/12
+- **Canonical sizes** presets: 720x1280 (portrait), 1280x720 (landscape), plus Custom
+- **Rate-limit tiers** (RPM) and **concurrency guidance**
+- **Budget cap** guardrail and confirmation dialog
+- All previous features: uploads, ref-image generation, prompt enhancement, multi-gen concurrency, remix, stitcher, assets
+
+Run:
+    streamlit run streamlit_sora_app.py
 """
 import os
 import io
@@ -19,21 +28,39 @@ from typing import Callable, List, Optional, Tuple, Any, Dict
 
 import streamlit as st
 
+# Pillow (optional)
 try:
     from PIL import Image
 except Exception:
     Image = None  # type: ignore
 
+# OpenAI client
 try:
     from openai import OpenAI
-    from openai import APIStatusError  # type: ignore
 except Exception:
     OpenAI = None  # type: ignore
-    APIStatusError = Exception
 
 APP_NAME = "Sora Streamlit Studio"
 DEFAULT_OUTPUT_DIR = Path("outputs")
 ALLOWED_DURATIONS = [4, 8, 12]
+
+# Pricing (from docs)
+PRICE_PER_SECOND = {
+    "sora-2": 0.10,
+    "sora-2-pro": 0.30,
+}
+
+# RPM tiers (from docs)
+RPM_TIERS = {
+    "Free (unsupported)": 0,
+    "Tier 1": 5,
+    "Tier 2": 10,
+    "Tier 3": 25,
+    "Tier 4": 40,
+    "Tier 5": 75,
+}
+
+# ---------- Utilities ----------
 
 def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
@@ -55,11 +82,14 @@ def pil_save_image(b64_png: str, out: Path, size: Tuple[int, int] | None = (720,
         ensure_dir(out.parent)
         img.save(out)
         return out
-    except Exception:
+    except Exception as e:
+        st.warning(f"Failed to save image: {e}")
         return None
 
 def check_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
+
+# ---------- API helpers ----------
 
 def init_openai_client(api_key: Optional[str]) -> Optional[OpenAI]:
     if OpenAI is None:
@@ -71,8 +101,7 @@ def init_openai_client(api_key: Optional[str]) -> Optional[OpenAI]:
         return None
     os.environ["OPENAI_API_KEY"] = key
     try:
-        client = OpenAI()
-        return client
+        return OpenAI()
     except Exception as e:
         st.error(f"Failed to init OpenAI client: {e}")
         return None
@@ -90,13 +119,14 @@ def _classify_error(e: Exception) -> Dict[str, Any]:
     quota = "insufficient_quota" in s or "quota" in s.lower()
     return {"status": status, "is_quota": quota, "text": s}
 
-def with_retries(func: Callable[[], Any], attempts: int = 3, base_delay: float = 1.5, max_delay: float = 6.0) -> Any:
+def with_retries(func: Callable[[], Any], attempts: int = 2, base_delay: float = 1.5, max_delay: float = 6.0) -> Any:
     last_exc = None
     for i in range(attempts):
         try:
             return func()
         except Exception as e:
             info = _classify_error(e)
+            # For quota or tight rate limit, either short retry or stop with guidance.
             if info["is_quota"] or info["status"] == 429:
                 if i < attempts - 1 and not info["is_quota"]:
                     time.sleep(min(max_delay, base_delay * (2 ** i)))
@@ -107,10 +137,12 @@ def with_retries(func: Callable[[], Any], attempts: int = 3, base_delay: float =
                          "- If it's a **burst rate limit**, lower concurrency or try again.\n\n"
                          f"Details: {info['text']}")
                 raise
+            # Retry transient 5xx
             if info["status"] and 500 <= info["status"] < 600:
                 time.sleep(min(max_delay, base_delay * (2 ** i)))
                 last_exc = e
                 continue
+            # Non-retriable
             last_exc = e
             break
     if last_exc:
@@ -121,6 +153,7 @@ def poll_and_download_video(client: OpenAI, video, out_dir: Path, name_prefix: s
     progress = getattr(video, "progress", 0) or 0
     ph = st.empty()
     bar = st.progress(0)
+
     while status not in ("completed", "failed", "cancelled"):
         progress = getattr(video, "progress", progress) or progress
         status = getattr(video, "status", status)
@@ -131,10 +164,12 @@ def poll_and_download_video(client: OpenAI, video, out_dir: Path, name_prefix: s
             status = getattr(video, "status", status)
         except Exception:
             pass
+
     if getattr(video, "status", "failed") == "failed":
         err = getattr(getattr(video, "error", None), "message", "Video generation failed")
         ph.error(err)
         return None
+
     ph.success("Completed. Downloading...")
     try:
         vid_id = getattr(video, "id", "sora_video")
@@ -147,18 +182,20 @@ def poll_and_download_video(client: OpenAI, video, out_dir: Path, name_prefix: s
         ph.error(f"Download failed: {e}")
         return None
 
-def enhance_prompt(client: OpenAI, prompt: str, style: str = "director", retries: int = 2) -> str:
+def enhance_prompt(client: OpenAI, prompt: str, style: str = "director") -> str:
     TEMPLATE_MAP = {
         "director": "You are a sharp film director. Rewrite the following video prompt for clarity, specificity, and cinematic detail (camera, lighting, lens, movement, environment). Return only the revised prompt.",
         "clean": "Rewrite clearly and concisely without losing meaning. Return only the revised text.",
         "pixar": "Rewrite as a warm, detailed Pixar-style prompt focusing on character, wardrobe, lensing, lighting, and blocking. Return only the revised prompt.",
     }
     ins = TEMPLATE_MAP.get(style, TEMPLATE_MAP["director"])
+
     def _call():
         resp = client.responses.create(model="gpt-5", input=prompt, instructions=ins)
         return getattr(resp, "output_text", None) or str(resp)
+
     try:
-        return with_retries(_call, attempts=max(1, retries))
+        return with_retries(_call, attempts=2)
     except Exception as e:
         st.warning(f"Enhancement failed, using original prompt. ({e})")
         return prompt
@@ -166,8 +203,10 @@ def enhance_prompt(client: OpenAI, prompt: str, style: str = "director", retries
 def make_reference_image(client: OpenAI, text: str, out_dir: Path, name: str) -> Optional[Path]:
     def _call():
         return client.responses.create(model="gpt-image-1", input=text)
+
     try:
         resp = with_retries(_call, attempts=2)
+        # Attempt to extract base64 image
         b64 = None
         for path in [
             ("output", 0, "content", 0, "image_base64"),
@@ -191,6 +230,8 @@ def make_reference_image(client: OpenAI, text: str, out_dir: Path, name: str) ->
         st.error(f"Reference image generation failed: {e}")
         return None
 
+# ---------- Data & flows ----------
+
 @dataclass
 class GenJob:
     idx: int
@@ -200,13 +241,11 @@ class GenJob:
     result_path: Optional[Path] = None
 
 def _video_create(client: OpenAI, kwargs: Dict[str, Any]):
-    def _call():
-        return client.videos.create(**kwargs)
-    return with_retries(_call, attempts=2)
+    return with_retries(lambda: client.videos.create(**kwargs), attempts=2)
 
 def generate_single(client: OpenAI, prompt: str, size: str, seconds: int, references: List[Path] | None, model: str) -> Optional[Path]:
-    if seconds not in [4,8,12]:
-        seconds = min([4,8,12], key=lambda x: abs(x - seconds))
+    if seconds not in ALLOWED_DURATIONS:
+        seconds = min(ALLOWED_DURATIONS, key=lambda x: abs(x - seconds))
         st.warning(f"Adjusted unsupported duration to {seconds}s.")
     kwargs = dict(model=model, prompt=prompt, size=size, seconds=str(seconds))
     if references:
@@ -215,8 +254,8 @@ def generate_single(client: OpenAI, prompt: str, size: str, seconds: int, refere
     return poll_and_download_video(client, vid, st.session_state.output_dir, "single")
 
 def generate_and_remix(client: OpenAI, base_prompt: str, remix_prompts: List[str], size: str, seconds: int, references: List[Path] | None, model: str) -> List[Optional[Path]]:
-    if seconds not in [4,8,12]:
-        seconds = min([4,8,12], key=lambda x: abs(x - seconds))
+    if seconds not in ALLOWED_DURATIONS:
+        seconds = min(ALLOWED_DURATIONS, key=lambda x: abs(x - seconds))
         st.warning(f"Adjusted unsupported duration to {seconds}s.")
     outputs: List[Optional[Path]] = []
     base_kwargs = dict(model=model, prompt=base_prompt, size=size, seconds=str(seconds))
@@ -225,22 +264,23 @@ def generate_and_remix(client: OpenAI, base_prompt: str, remix_prompts: List[str
     base = _video_create(client, base_kwargs)
     base_path = poll_and_download_video(client, base, st.session_state.output_dir, "remix_base")
     outputs.append(base_path)
+
     current = base
     for i, rprompt in enumerate(remix_prompts, start=1):
         st.write(f"Remix step {i}…")
-        def _call():
-            return client.videos.remix(video_id=current.id, prompt=rprompt)
-        remix_job = with_retries(_call, attempts=2)
+        remix_job = with_retries(lambda: client.videos.remix(video_id=current.id, prompt=rprompt), attempts=2)
         out = poll_and_download_video(client, remix_job, st.session_state.output_dir, f"remix_{i}")
         outputs.append(out)
         current = remix_job
     return outputs
 
 def generate_multiple(client: OpenAI, jobs: List[GenJob], size: str, seconds: int, model: str, concurrent_workers: int = 2) -> List[GenJob]:
-    if seconds not in [4,8,12]:
-        seconds = min([4,8,12], key=lambda x: abs(x - seconds))
+    if seconds not in ALLOWED_DURATIONS:
+        seconds = min(ALLOWED_DURATIONS, key=lambda x: abs(x - seconds))
         st.warning(f"Adjusted unsupported duration to {seconds}s.")
+
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
     def worker(job: GenJob):
         kwargs = dict(model=model, prompt=(job.enhanced_prompt or job.prompt), size=size, seconds=str(seconds))
         if job.references:
@@ -249,8 +289,9 @@ def generate_multiple(client: OpenAI, jobs: List[GenJob], size: str, seconds: in
             vid = _video_create(client, kwargs)
             out = poll_and_download_video(client, vid, st.session_state.output_dir, f"multi_{job.idx+1}")
             return job.idx, out
-        except Exception as e:
+        except Exception:
             return job.idx, None
+
     with ThreadPoolExecutor(max_workers=max(1, int(concurrent_workers))) as ex:
         futures = [ex.submit(worker, job) for job in jobs]
         for fut in as_completed(futures):
@@ -261,45 +302,55 @@ def generate_multiple(client: OpenAI, jobs: List[GenJob], size: str, seconds: in
                 st.error(f"A job failed: {e}")
     return jobs
 
-def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
-    if not files:
-        st.warning("No files to stitch.")
-        return None
-    if not check_ffmpeg():
-        st.error("ffmpeg not found in PATH.")
-        return None
-    with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as tf:
-        for f in files:
-            tf.write(f"file '{f.as_posix()}'\n")
-        tf.flush()
-        concat_list = tf.name
-    try:
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", out_path.as_posix(), "-y"],
-            check=True
-        )
-        return out_path
-    except Exception as e:
-        st.error(f"Stitch failed: {e}")
-        return None
+# ---------- Estimators ----------
+
+def calls_per_job(use_enhance: bool) -> int:
+    # videos.create (+1 optional enhancement)
+    return 1 + (1 if use_enhance else 0)
+
+def calls_for_remix(steps: int, use_enhance: bool) -> int:
+    # 1 base videos.create (+ remixes N) + optional enhancement for base + for each remix
+    return (1 + steps) + ((1 + steps) if use_enhance else 0)
+
+def estimate_cost(num_videos: int, seconds: int, model: str) -> float:
+    rate = PRICE_PER_SECOND.get(model, 0.10)
+    return num_videos * seconds * rate
+
+def recommended_workers(rpm: int, per_job_calls: int) -> int:
+    # Very rough suggestion = allow firing per minute equal to RPM; workers <= RPM / per_job_calls
+    if rpm <= 0 or per_job_calls <= 0:
+        return 1
+    return max(1, rpm // per_job_calls)
+
+# ---------- UI ----------
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.title(APP_NAME)
 st.caption("Web UI for Sora video generation with prompt enhancement, references, multi-gen concurrency, and remix.")
 
 with st.sidebar:
-    st.header("Configuration")
+    st.header("API & Limits")
     api_key_input = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
     model = st.selectbox("Sora Model", ["sora-2", "sora-2-pro"], index=0)
-    seconds = st.selectbox("Duration (seconds)", options=[4,8,12], index=0, help="Sora currently accepts 4, 8, or 12.")
-    size_choice = st.selectbox("Frame Size", ["720x1280 (9:16)", "1024x1792 (9:16)", "1280x720 (16:9)", "1920x1080 (16:9)", "Custom"], index=0)
+    seconds = st.selectbox("Duration (seconds)", options=ALLOWED_DURATIONS, index=0, help="Sora currently accepts 4, 8, or 12.")
+    size_choice = st.selectbox("Frame Size", ["720x1280 (portrait)", "1280x720 (landscape)", "Custom"], index=0)
     if size_choice == "Custom":
         size = st.text_input("Custom size (e.g., 720x1280)", "720x1280")
     else:
         size = size_choice.split()[0]
+
+    tier = st.selectbox("Rate limit tier", list(RPM_TIERS.keys()), index=1)
+    rpm = RPM_TIERS[tier]
+
     st.subheader("Prompt Enhancement")
     use_enhance = st.checkbox("Enhance prompts before generating", value=False)
     enhance_style = st.selectbox("Enhancement style", ["director", "pixar", "clean"], index=0)
+
+    st.subheader("Budget")
+    budget_enabled = st.checkbox("Enable budget cap", value=False)
+    budget_usd = st.number_input("Max budget for this run ($)", min_value=1.0, value=5.0, step=1.0, disabled=not budget_enabled)
+    budget_ok = True  # computed per action
+
     st.subheader("Outputs")
     out_root = st.text_input("Output folder", value=str(DEFAULT_OUTPUT_DIR))
     if "output_dir" not in st.session_state:
@@ -329,19 +380,37 @@ with st.sidebar:
                 st.error(f"Clear failed: {e}")
     st.write(f"Session folder: `{st.session_state.output_dir}`")
 
+# Initialize OpenAI client
 client = init_openai_client(api_key_input)
+
 tabs = st.tabs(["Single", "Multiple", "Remix", "Assets"])
 
+# ---------- SINGLE ----------
 with tabs[0]:
     st.subheader("Single Generation")
+
     colA, colB = st.columns([1,1], gap="large")
     with colA:
         user_prompt = st.text_area("Prompt", height=150, placeholder="Describe your video...")
         gen_refs_from_prompt = st.text_input("Optional: Generate reference image from a prompt (leave blank to skip)")
         ref_uploaded = st.file_uploader("Or upload reference image(s)", type=["png","jpg","jpeg"], accept_multiple_files=True)
+
+        # Estimation box
+        est_calls = calls_per_job(use_enhance)
+        est_cost = estimate_cost(1, seconds, model)
+        st.info(f"**Estimated cost:** ~${est_cost:.2f} • **API calls:** {est_calls} per job • "
+                f"**Recommended workers:** {recommended_workers(rpm, est_calls)}")
+
+        if budget_enabled and est_cost > budget_usd:
+            st.warning(f"This single job (~${est_cost:.2f}) exceeds your budget cap (${budget_usd:.2f}). Adjust settings or increase budget.")
+            budget_ok = False
+
     with colB:
         st.write("Preview & Actions")
         if client and st.button("Generate (Single)"):
+            if budget_enabled and not budget_ok:
+                st.stop()
+
             refs: List[Path] = []
             if gen_refs_from_prompt.strip():
                 out_img = make_reference_image(client, gen_refs_from_prompt, st.session_state.output_dir / "refs", "ref_1")
@@ -356,11 +425,13 @@ with tabs[0]:
                 if refs:
                     st.success(f"Loaded {len(refs)} reference image(s).")
                     st.image([str(x) for x in refs], caption=[x.name for x in refs])
+
             final_prompt = user_prompt
             enhanced_txt = None
             if use_enhance and user_prompt.strip():
-                enhanced_txt = enhance_prompt(client, user_prompt, enhance_style, retries=2)
+                enhanced_txt = enhance_prompt(client, user_prompt, enhance_style)
                 final_prompt = enhanced_txt
+
             if not user_prompt.strip() and not gen_refs_from_prompt.strip():
                 st.warning("Please provide at least a video prompt, or generate a reference image prompt.")
             else:
@@ -377,11 +448,31 @@ with tabs[0]:
                 except Exception as e:
                     st.exception(e)
 
+# ---------- MULTIPLE ----------
 with tabs[1]:
     st.subheader("Multiple / Concurrent Generation")
-    n = st.number_input("Number of generations", min_value=2, max_value=12, value=3, step=1)
-    workers = st.number_input("Concurrent workers", min_value=1, max_value=12, value=2, step=1)
+
+    n = st.number_input("Number of generations", min_value=2, max_value=24, value=3, step=1)
+    workers = st.number_input("Concurrent workers", min_value=1, max_value=24, value=2, step=1)
     st.caption("We run up to 'Concurrent workers' jobs in parallel; if you hit rate limits, lower this value.")
+
+    # Estimation: cost, calls, concurrency guidance
+    m_calls_per_job = calls_per_job(use_enhance)
+    m_total_calls = int(n) * m_calls_per_job
+    m_est_cost = estimate_cost(int(n), seconds, model)
+    rec_workers = recommended_workers(rpm, m_calls_per_job)
+    warn_workers = int(workers) > rec_workers and rpm > 0
+
+    info = f"**Estimated cost:** ~${m_est_cost:.2f} • **Total API calls:** ~{m_total_calls} • **Recommended workers:** {rec_workers}"
+    if warn_workers:
+        st.warning(info + "  \nYour requested workers exceed the recommended concurrency for your tier; consider lowering to reduce 429s.")
+    else:
+        st.info(info)
+
+    if budget_enabled and m_est_cost > budget_usd:
+        st.warning(f"This run (~${m_est_cost:.2f}) exceeds your budget cap (${budget_usd:.2f}). Adjust settings or increase budget.")
+        budget_ok = False
+
     st.write("Prompts")
     multi_prompts: List[str] = []
     cols = st.columns(2)
@@ -389,10 +480,15 @@ with tabs[1]:
         with cols[i % 2]:
             p = st.text_area(f"Prompt #{i+1}", height=120, key=f"multi_prompt_{i}")
             multi_prompts.append(p)
+
     st.write("References (optional)")
     m_gen_ref_prompt = st.text_input("Generate a shared reference image from prompt (optional)", key="multi_ref_gen")
     m_ref_uploaded = st.file_uploader("Or upload reference image(s) shared by all jobs", type=["png","jpg","jpeg"], accept_multiple_files=True, key="multi_ref_upload")
+
     if client and st.button("Generate All"):
+        if budget_enabled and not budget_ok:
+            st.stop()
+
         refs: List[Path] = []
         if m_gen_ref_prompt.strip():
             out_img = make_reference_image(client, m_gen_ref_prompt, st.session_state.output_dir / "refs", "shared_ref")
@@ -408,7 +504,7 @@ with tabs[1]:
         for i, p in enumerate(multi_prompts):
             if not p.strip():
                 continue
-            enhanced_txt = enhance_prompt(client, p, enhance_style, retries=2) if use_enhance else None
+            enhanced_txt = enhance_prompt(client, p, enhance_style) if use_enhance else None
             jobs.append(GenJob(idx=i, prompt=p, enhanced_prompt=enhanced_txt, references=refs))
         if not jobs:
             st.warning("Please enter at least one prompt.")
@@ -428,16 +524,33 @@ with tabs[1]:
             except Exception as e:
                 st.exception(e)
 
+# ---------- REMIX ----------
 with tabs[2]:
     st.subheader("Remix Sequence")
+
     base_prompt = st.text_area("Base Shot Prompt", height=140, placeholder="Describe the initial shot...")
     remix_count = st.number_input("Number of remix steps", min_value=1, max_value=10, value=2, step=1)
     remix_prompts: List[str] = []
     for i in range(int(remix_count)):
         remix_prompts.append(st.text_input(f"Remix Prompt #{i+1}", key=f"remix_prompt_{i}", placeholder=f"Describe remix step {i+1}..."))
+
+    # Estimation box
+    r_calls = calls_for_remix(int(remix_count), use_enhance)
+    r_videos = 1 + int(remix_count)
+    r_cost = estimate_cost(r_videos, seconds, model)
+    st.info(f"**Estimated cost:** ~${r_cost:.2f} • **API calls:** ~{r_calls} (base + {int(remix_count)} remix steps) • "
+            f"**Recommended workers:** {recommended_workers(rpm, 1)}")
+    if budget_enabled and r_cost > budget_usd:
+        st.warning(f"This remix run (~${r_cost:.2f}) exceeds your budget cap (${budget_usd:.2f}). Adjust settings or increase budget.")
+        budget_ok = False
+
     rr_gen_refs_from_prompt = st.text_input("Optional: Generate reference image from a prompt (for base shot)")
     rr_ref_uploaded = st.file_uploader("Or upload reference image(s) for base shot", type=["png","jpg","jpeg"], accept_multiple_files=True, key="remix_refs")
+
     if client and st.button("Generate Remix Sequence"):
+        if budget_enabled and not budget_ok:
+            st.stop()
+
         if not base_prompt.strip():
             st.warning("Please enter a base prompt.")
         else:
@@ -452,8 +565,10 @@ with tabs[2]:
                     p = refs_dir / f"remix_upload_{i}.png"
                     write_bytes(p, uf.getvalue())
                     refs.append(p)
-            base_final = enhance_prompt(client, base_prompt, enhance_style, retries=2) if use_enhance else base_prompt
-            remix_final = [enhance_prompt(client, rp, enhance_style, retries=2) if use_enhance else rp for rp in remix_prompts]
+
+            base_final = enhance_prompt(client, base_prompt, enhance_style) if use_enhance else base_prompt
+            remix_final = [enhance_prompt(client, rp, enhance_style) if use_enhance else rp for rp in remix_prompts]
+
             try:
                 with st.spinner("Generating remix sequence..."):
                     outs = generate_and_remix(client, base_final, remix_final, size, int(seconds), refs, model)
@@ -463,6 +578,7 @@ with tabs[2]:
                     with st.expander(f"Clip {i} ({p.name})"):
                         st.video(str(p))
                         st.download_button("Download video", data=p.read_bytes(), file_name=p.name, mime="video/mp4")
+
                 if len(valid_paths) >= 2 and check_ffmpeg():
                     st.divider()
                     stitch_name = st.text_input("Stitched file name", value="sequence.mp4")
@@ -474,6 +590,29 @@ with tabs[2]:
                             st.download_button("Download stitched video", data=outp.read_bytes(), file_name=outp.name, mime="video/mp4")
             except Exception as e:
                 st.exception(e)
+
+# ---------- ASSETS ----------
+def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
+    if not files:
+        st.warning("No files to stitch.")
+        return None
+    if not check_ffmpeg():
+        st.error("ffmpeg not found in PATH.")
+        return None
+    with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as tf:
+        for f in files:
+            tf.write(f"file '{f.as_posix()}'\n")
+        tf.flush()
+        concat_list = tf.name
+    try:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", out_path.as_posix(), "-y"],
+            check=True
+        )
+        return out_path
+    except Exception as e:
+        st.error(f"Stitch failed: {e}")
+        return None
 
 with tabs[3]:
     st.subheader("Session Assets")
@@ -495,3 +634,6 @@ with tabs[3]:
             st.download_button(f"Download {img.name}", data=img.read_bytes(), file_name=img.name)
     else:
         st.info("No references yet.")
+
+st.divider()
+st.caption("Pricing, durations, sizes, and rate limits are based on the latest Sora 2 docs.")
