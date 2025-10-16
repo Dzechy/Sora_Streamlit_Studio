@@ -68,19 +68,6 @@ _An end-to-end Streamlit app for creating watermark-free videos with OpenAI’s 
 
 -----
 
-## Screenshots (optional)
-
-Include a few screenshots/GIFs to showcase the Single, Multiple, Remix, and Batch tabs.
-
-```
-/docs/img/single.png
-/docs/img/multi.png
-/docs/img/remix.png
-/docs/img/batch.png
-```
-
------
-
 ## Requirements
 
 - **Python 3.10+** (3.11 recommended)
