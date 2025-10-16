@@ -102,7 +102,7 @@ export OPENAI_API_KEY=sk-...    # macOS/Linux
 1. **Run the app:**
 
 ```bash
-streamlit run streamlit_sora_app.py
+streamlit run Sora_Streamlit_Studio.py
 ```
 
 **Tip:** You can also paste your API key directly into the app’s sidebar.
@@ -111,7 +111,7 @@ streamlit run streamlit_sora_app.py
 
 ## Configuration
 
-Most settings live in the sidebar at runtime. For static defaults, edit the constants at the top of `streamlit_sora_app.py`:
+Most settings live in the sidebar at runtime. For static defaults, edit the constants at the top of `Sora_Streamlit_Studio.py`:
 
 ```python
 PRICE_PER_SECOND = {"sora-2": 0.10, "sora-2-pro": 0.30}
@@ -126,7 +126,7 @@ If pricing, supported durations, or rate-limit tiers change, update them here.
 ## Running on Streamlit Community Cloud
 
 1. Push the repo to GitHub.
-1. Create a new Streamlit app and target `streamlit_sora_app.py`.
+1. Create a new Streamlit app and target `Sora_Streamlit_Studio.py`.
 1. **Set Secrets:**
 
 - In your app dashboard → Settings → Secrets:
@@ -152,14 +152,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY streamlit_sora_app.py /app/
+COPY Sora_Streamlit_Studio.py /app/
 
 RUN pip install --no-cache-dir streamlit openai pillow
 
 ENV OPENAI_API_KEY=""
 EXPOSE 8501
 
-CMD ["streamlit", "run", "streamlit_sora_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+CMD ["streamlit", "run", "Sora_Streamlit_Studio.py", "--server.address=0.0.0.0", "--server.port=8501"]
 ```
 
 **Build & run:**
@@ -263,7 +263,7 @@ docker run -it --rm -p 8501:8501 -e OPENAI_API_KEY=sk-... sora-studio
   - The sidebar RPM setting configures a token-bucket limiter used by all API calls (enhancement, image generation, video create, remix).
   - This is advisory — pick the tier that fits your account to minimize 429s.
 
-Update the constants at the top of `streamlit_sora_app.py` if pricing or rate-limit tiers change for your account.
+Update the constants at the top of `Sora_Streamlit_Studio.py` if pricing or rate-limit tiers change for your account.
 
 -----
 
@@ -316,7 +316,7 @@ Install FFmpeg (see [Requirements](#requirements)) and you’ll see a “Stitch 
 
 ## Advanced Configuration
 
-Open `streamlit_sora_app.py` and adjust:
+Open `Sora_Streamlit_Studio.py` and adjust:
 
 ```python
 # Pricing (used by the cost estimator)
