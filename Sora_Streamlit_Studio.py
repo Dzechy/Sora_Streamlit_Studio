@@ -19,13 +19,12 @@ import shutil
 import subprocess
 import threading
 import inspect
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Any, Dict
 
 import streamlit as st
 
-# Optional Pillow for image I/O and montage
 try:
     from PIL import Image, ImageOps
     PILLOW_AVAILABLE = True
@@ -34,7 +33,6 @@ except ImportError:
     ImageOps = None
     PILLOW_AVAILABLE = False
 
-# OpenAI client
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
@@ -45,16 +43,13 @@ except ImportError:
 APP_NAME = "Sora Streamlit Studio"
 DEFAULT_OUTPUT_DIR = Path("outputs")
 
-# Pricing used for the estimator (update to match your plan)
 PRICE_PER_SECOND = {
     "sora-2": 0.10,
     "sora-2-pro": 0.30,
 }
 
-# Supported durations for strict mode
 CURRENT_SUPPORTED_DURATIONS = [4, 8, 12]
 
-# Example RPM tiers for a token-bucket limiter
 RPM_TIERS = {
     "Free (unsupported)": 0,
     "Tier 1": 5,
@@ -69,18 +64,15 @@ RPM_TIERS = {
 # -------------------------
 
 def ensure_dir(p: Path) -> Path:
-    """Create directory if it doesn't exist."""
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 def write_bytes(path: Path, data: bytes) -> Path:
-    """Write bytes to file, creating parent directories if needed."""
     ensure_dir(path.parent)
     path.write_bytes(data)
     return path
 
 def parse_size(size_str: str, fallback: Tuple[int, int] = (720, 1280)) -> Tuple[int, int]:
-    """Parse size string like '720x1280' into tuple of ints."""
     try:
         w, h = size_str.lower().split("x")
         return int(w), int(h)
@@ -88,7 +80,6 @@ def parse_size(size_str: str, fallback: Tuple[int, int] = (720, 1280)) -> Tuple[
         return fallback
 
 def pil_resize_letterbox(img: "Image.Image", canvas_size: Tuple[int, int]) -> "Image.Image":
-    """Resize image to fit inside canvas_size with letterboxing (no distortion)."""
     if not PILLOW_AVAILABLE:
         return img
     cw, ch = canvas_size
@@ -100,12 +91,11 @@ def pil_resize_letterbox(img: "Image.Image", canvas_size: Tuple[int, int]) -> "I
     return canvas
 
 def pil_save_image(
-    b64_png: str, 
-    out: Path, 
-    size: Optional[Tuple[int, int]] = (720, 1280), 
+    b64_png: str,
+    out: Path,
+    size: Optional[Tuple[int, int]] = (720, 1280),
     letterbox: bool = True
 ) -> Optional[Path]:
-    """Save a base64 image to file, optionally resizing/letterboxing to target canvas size."""
     try:
         raw = base64.b64decode(b64_png)
         if not PILLOW_AVAILABLE:
@@ -121,26 +111,21 @@ def pil_save_image(
         return None
 
 def check_ffmpeg() -> bool:
-    """Check if ffmpeg is available in PATH."""
     return shutil.which("ffmpeg") is not None
 
 def price_rate(model: str) -> float:
-    """Get price per second for the given model."""
     return PRICE_PER_SECOND.get(model, 0.10)
 
 def estimate_cost(num_videos: int, seconds: int, model: str) -> float:
-    """Calculate estimated cost for video generation."""
     return num_videos * seconds * price_rate(model)
 
 def init_budget_state():
-    """Initialize budget tracking in session state."""
     st.session_state.setdefault("spent_usd", 0.0)
     st.session_state.setdefault("counted_ids", set())
     st.session_state.setdefault("budget_enabled", False)
     st.session_state.setdefault("budget_limit", 10.0)
 
 def add_spend_if_new(video_id: str, seconds: int, model: str):
-    """Add video cost to budget tracker if not already counted."""
     if video_id and video_id not in st.session_state.counted_ids:
         st.session_state.counted_ids.add(video_id)
         st.session_state.spent_usd += seconds * price_rate(model)
@@ -150,7 +135,6 @@ def add_spend_if_new(video_id: str, seconds: int, model: str):
 # -------------------------
 
 class RateLimiter:
-    """Token-bucket limiter keyed to RPM. Thread-safe; blocks until refill when empty."""
     def __init__(self, rpm: int):
         self.rpm = max(0, int(rpm))
         self.tokens = self.rpm
@@ -158,14 +142,12 @@ class RateLimiter:
         self.last_refill = time.monotonic()
 
     def _maybe_refill(self):
-        """Refill tokens if a minute has elapsed."""
         now = time.monotonic()
         if now - self.last_refill >= 60.0:
             self.tokens = self.rpm
             self.last_refill = now
 
     def acquire(self, calls: int = 1):
-        """Acquire tokens, blocking if necessary until refill."""
         if self.rpm <= 0:
             return
         while True:
@@ -178,11 +160,9 @@ class RateLimiter:
             time.sleep(wait_s)
 
 def get_rate_limiter() -> Optional[RateLimiter]:
-    """Get rate limiter from session state."""
     return st.session_state.get("rate_limiter")
 
 def rl_acquire(n: int = 1):
-    """Acquire n tokens from rate limiter if it exists."""
     rl = get_rate_limiter()
     if rl:
         rl.acquire(n)
@@ -192,7 +172,6 @@ def rl_acquire(n: int = 1):
 # -------------------------
 
 def init_openai_client(api_key: Optional[str]) -> Optional[OpenAI]:
-    """Initialize OpenAI client with provided or environment API key."""
     if not OPENAI_AVAILABLE:
         st.error("OpenAI SDK not installed. Try: `pip install openai`")
         return None
@@ -208,7 +187,6 @@ def init_openai_client(api_key: Optional[str]) -> Optional[OpenAI]:
         return None
 
 def _classify_error(e: Exception) -> Dict[str, Any]:
-    """Extract status code and quota information from exception."""
     s = str(e)
     status = None
     if hasattr(e, "status_code"):
@@ -222,12 +200,11 @@ def _classify_error(e: Exception) -> Dict[str, Any]:
     return {"status": status, "is_quota": quota, "text": s}
 
 def with_retries(
-    func: Callable[[], Any], 
-    attempts: int = 2, 
-    base_delay: float = 1.5, 
+    func: Callable[[], Any],
+    attempts: int = 2,
+    base_delay: float = 1.5,
     max_delay: float = 6.0
 ) -> Any:
-    """Execute function with exponential backoff retry logic."""
     last_exc = None
     for i in range(attempts):
         try:
@@ -235,28 +212,20 @@ def with_retries(
         except Exception as e:
             info = _classify_error(e)
             last_exc = e
-            
-            # Handle quota errors immediately
             if info["is_quota"]:
                 st.error("Quota exceeded. Details: " + info["text"])
                 raise
-            
-            # Retry on rate limits (429) or server errors (5xx)
             if info["status"] == 429 or (info["status"] and 500 <= info["status"] < 600):
                 if i < attempts - 1:
                     delay = min(max_delay, base_delay * (2 ** i))
                     time.sleep(delay)
                     continue
-            
-            # Non-retryable error
             break
-    
     if last_exc:
         raise last_exc
     return None
 
 def call_api_with_rl(fn: Callable[[], Any]) -> Any:
-    """Call API function with rate limiting and retry logic."""
     rl_acquire(1)
     return with_retries(fn, attempts=2)
 
@@ -265,24 +234,26 @@ def call_api_with_rl(fn: Callable[[], Any]) -> Any:
 # -------------------------
 
 def poll_and_download_video(
-    client: OpenAI, 
-    video, 
-    out_dir: Path, 
-    name_prefix: str, 
-    seconds: int, 
+    client: OpenAI,
+    video,
+    out_dir: Path,
+    name_prefix: str,
+    seconds: int,
     model: str
 ) -> Tuple[Optional[Path], Optional[str]]:
-    """Poll video generation status and download when complete."""
     status = getattr(video, "status", None)
     progress = getattr(video, "progress", 0) or 0
     ph = st.empty()
     bar = st.progress(0)
 
+    def clamp01(x: float) -> float:
+        return max(0.0, min(1.0, x))
+
     while status not in ("completed", "failed", "cancelled"):
         progress = getattr(video, "progress", progress) or progress
         status = getattr(video, "status", status)
         bar.progress(int(max(0, min(100, progress))))
-        ph.info(f"Status: {status} • {progress}%")
+        ph.info(f"Status: {status} • {int(max(0, min(100, progress)))}%")
         time.sleep(1.0)
         try:
             video = client.videos.retrieve(video.id)
@@ -309,7 +280,6 @@ def poll_and_download_video(
         return None, None
 
 def enhance_prompt(client: OpenAI, prompt: str, style: str = "director") -> str:
-    """Enhance prompt using GPT model with specified style."""
     TEMPLATE_MAP = {
         "director": "You are a sharp film director. Rewrite the following video prompt for clarity, specificity, and cinematic detail (camera, lighting, lens, movement, environment). Return only the revised prompt.",
         "clean": "Rewrite clearly and concisely without losing meaning. Return only the revised text.",
@@ -319,7 +289,7 @@ def enhance_prompt(client: OpenAI, prompt: str, style: str = "director") -> str:
     try:
         resp = call_api_with_rl(
             lambda: client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": ins},
                     {"role": "user", "content": prompt}
@@ -336,13 +306,12 @@ def enhance_prompt(client: OpenAI, prompt: str, style: str = "director") -> str:
 # -------------------------
 
 def make_reference_image(
-    client: OpenAI, 
-    text: str, 
-    out_dir: Path, 
-    name: str, 
+    client: OpenAI,
+    text: str,
+    out_dir: Path,
+    name: str,
     canvas_size: Tuple[int, int] = (720, 1280)
 ) -> Optional[Path]:
-    """Generate a reference image via Images API and letterbox to desired canvas."""
     try:
         resp = call_api_with_rl(
             lambda: client.images.generate(
@@ -360,12 +329,11 @@ def make_reference_image(
         return None
 
 def _decide_grid(
-    n: int, 
-    layout_mode: str, 
-    custom_cols: Optional[int], 
+    n: int,
+    layout_mode: str,
+    custom_cols: Optional[int],
     custom_rows: Optional[int]
 ) -> Tuple[int, int]:
-    """Return (cols, rows) according to the layout strategy."""
     if layout_mode == "Auto":
         if n <= 2:
             return (1, n)
@@ -393,7 +361,6 @@ def _decide_grid(
         cols = 3
         rows = math.ceil(n / cols)
         return (cols, rows)
-    # Custom
     c = max(1, int(custom_cols or 1))
     r = max(1, int(custom_rows or 1))
     return (c, r)
@@ -409,12 +376,10 @@ def combine_reference_images(
     padding: int = 0,
     bg_color: Tuple[int, int, int] = (0, 0, 0),
 ) -> Optional[Path]:
-    """Combine multiple reference images into a single contact-sheet montage."""
     if not paths:
         return None
     if len(paths) == 1:
         return paths[0]
-
     if not PILLOW_AVAILABLE:
         st.warning("Pillow is not installed; using only the first uploaded reference.")
         return paths[0]
@@ -426,7 +391,6 @@ def combine_reference_images(
     if len(paths) > capacity:
         st.warning(f"Montage capacity is {capacity} cells ({cols}×{rows}). Using the first {capacity} image(s) out of {len(paths)}.")
 
-    # Compute inner area with uniform padding
     p = max(0, int(padding))
     inner_w = max(1, cw - (cols + 1) * p)
     inner_h = max(1, ch - (rows + 1) * p)
@@ -472,7 +436,6 @@ def build_single_reference(
     montage_rows: Optional[int] = None,
     montage_padding: int = 0,
 ) -> Optional[Path]:
-    """Return a single Path to pass to Sora API."""
     if not ref_paths:
         return None
     if len(ref_paths) == 1:
@@ -501,39 +464,40 @@ class GenJob:
     result_path: Optional[Path] = None
 
 def _video_create(client: OpenAI, kwargs: Dict[str, Any]):
-    """Create video with API call wrapper."""
     return call_api_with_rl(lambda: client.videos.create(**kwargs))
 
 def generate_single(
-    client: OpenAI, 
-    prompt: str, 
-    size: str, 
-    seconds: int, 
-    references: Optional[List[Path]], 
+    client: OpenAI,
+    prompt: str,
+    size: str,
+    seconds: int,
+    references: Optional[List[Path]],
     model: str
 ) -> Optional[Path]:
-    """Generate a single video."""
-    kwargs = dict(model=model, prompt=prompt, size=size, seconds=str(seconds))
+    kwargs = dict(model=model, prompt=prompt, size=size, seconds=int(seconds))
     if references:
-        kwargs["input_reference"] = str(references[0])
+        r0 = Path(references[0])
+        if r0.exists():
+            kwargs["input_reference"] = str(r0)
     vid = _video_create(client, kwargs)
     path, _ = poll_and_download_video(client, vid, st.session_state.output_dir, "single", seconds, model)
     return path
 
 def generate_and_remix(
-    client: OpenAI, 
-    base_prompt: str, 
-    remix_prompts: List[str], 
-    size: str, 
-    seconds: int, 
-    references: Optional[List[Path]], 
+    client: OpenAI,
+    base_prompt: str,
+    remix_prompts: List[str],
+    size: str,
+    seconds: int,
+    references: Optional[List[Path]],
     model: str
 ) -> List[Optional[Path]]:
-    """Generate base video and apply remix transformations."""
     outputs: List[Optional[Path]] = []
-    base_kwargs = dict(model=model, prompt=base_prompt, size=size, seconds=str(seconds))
+    base_kwargs = dict(model=model, prompt=base_prompt, size=size, seconds=int(seconds))
     if references:
-        base_kwargs["input_reference"] = str(references[0])
+        r0 = Path(references[0])
+        if r0.exists():
+            base_kwargs["input_reference"] = str(r0)
     base = _video_create(client, base_kwargs)
     base_path, _ = poll_and_download_video(client, base, st.session_state.output_dir, "remix_base", seconds, model)
     outputs.append(base_path)
@@ -548,20 +512,21 @@ def generate_and_remix(
     return outputs
 
 def generate_multiple(
-    client: OpenAI, 
-    jobs: List[GenJob], 
-    size: str, 
-    seconds: int, 
-    model: str, 
+    client: OpenAI,
+    jobs: List[GenJob],
+    size: str,
+    seconds: int,
+    model: str,
     concurrent_workers: int = 2
 ) -> List[GenJob]:
-    """Generate multiple videos concurrently."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    
+
     def worker(job: GenJob):
-        kwargs = dict(model=model, prompt=(job.enhanced_prompt or job.prompt), size=size, seconds=str(seconds))
+        kwargs = dict(model=model, prompt=(job.enhanced_prompt or job.prompt), size=size, seconds=int(seconds))
         if job.references:
-            kwargs["input_reference"] = str(job.references[0])
+            r0 = Path(job.references[0])
+            if r0.exists():
+                kwargs["input_reference"] = str(r0)
         try:
             vid = _video_create(client, kwargs)
             out_path, _ = poll_and_download_video(client, vid, st.session_state.output_dir, f"multi_{job.idx+1}", seconds, model)
@@ -585,7 +550,6 @@ def generate_multiple(
 # -------------------------
 
 def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
-    """Stitch multiple video files together using ffmpeg."""
     if not files:
         st.warning("No files to stitch.")
         return None
@@ -594,8 +558,7 @@ def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
         return None
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as tf:
         for f in files:
-            tf.write(f"file '{f.as_posix()}'
-")
+            tf.write(f"file '{f.as_posix()}'\n")
         tf.flush()
         concat_list = tf.name
     try:
@@ -627,7 +590,6 @@ def render_multi_prompt_inputs(
     height: int = 120,
     placeholder: str = "Describe your video..."
 ) -> List[str]:
-    """Render N prompt textareas in rows with top alignment."""
     prompts: List[str] = []
     supports_va = "vertical_alignment" in inspect.signature(st.columns).parameters
     total_rows = math.ceil(n / cols_per_row)
@@ -663,13 +625,11 @@ st.set_page_config(page_title=APP_NAME, layout="wide")
 st.title(APP_NAME)
 st.caption("Web UI for Sora video generation with prompt enhancement, references, multi-gen concurrency, remix, batch queue, and budget/rate-limit guardrails.")
 
-# Sidebar
 with st.sidebar:
     st.header("API & Limits")
     api_key_input = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
     model = st.selectbox("Sora Model", ["sora-2", "sora-2-pro"], index=0)
 
-    # Duration slider with strict snapping option
     seconds_slider = st.slider("Duration (seconds)", min_value=1, max_value=60, value=4, step=1)
     strict_durations = st.checkbox("Strict supported durations", value=True, help="When on, snaps to commonly supported values to avoid API errors.")
     st.caption(f"Currently supported durations: {', '.join(map(str, CURRENT_SUPPORTED_DURATIONS))} seconds.")
@@ -679,18 +639,15 @@ with st.sidebar:
     size = st.text_input("Custom size (e.g., 720x1280)", "720x1280") if size_choice == "Custom" else size_choice.split()[0]
     canvas_w, canvas_h = parse_size(size)
 
-    # Rate-limit tier
     tier = st.selectbox("Rate limit tier", list(RPM_TIERS.keys()), index=1)
     rpm = RPM_TIERS[tier]
     if "rate_limiter" not in st.session_state or getattr(st.session_state.get("rate_limiter"), "rpm", None) != rpm:
         st.session_state["rate_limiter"] = RateLimiter(rpm)
 
-    # Prompt enhancement
     st.subheader("Prompt Enhancement")
     use_enhance = st.checkbox("Enhance prompts before generating", value=False)
     enhance_style = st.selectbox("Enhancement style", ["director", "pixar", "clean"], index=0)
 
-    # Reference montage configuration
     st.subheader("Reference Montage")
     st.caption("Combine multiple uploaded images into one reference using these settings.")
     montage_layout = st.selectbox(
@@ -699,7 +656,7 @@ with st.sidebar:
         index=0,
         help="Auto chooses a grid to fit your count. For Custom, set columns/rows below."
     )
-    col_m1, col_m2, col_m3 = st.columns([1,1,1])
+    col_m1, col_m2, col_m3 = st.columns([1, 1, 1])
     with col_m1:
         montage_padding = st.number_input("Padding (px)", min_value=0, max_value=40, value=0, step=1)
     with col_m2:
@@ -707,7 +664,6 @@ with st.sidebar:
     with col_m3:
         montage_rows = st.number_input("Custom rows", min_value=1, max_value=8, value=2, step=1, disabled=(montage_layout != "Custom"))
 
-    # Budget
     init_budget_state()
     st.subheader("Budget")
     st.session_state.budget_enabled = st.checkbox("Enable budget cap", value=st.session_state.budget_enabled)
@@ -731,11 +687,14 @@ with st.sidebar:
         st.session_state.counted_ids = set()
         st.success("Spend counter reset.")
 
-    # Outputs
     st.subheader("Outputs")
     out_root = st.text_input("Output folder", value=str(DEFAULT_OUTPUT_DIR))
     if "output_dir" not in st.session_state:
         st.session_state.output_dir = ensure_dir(Path(out_root) / time.strftime("%Y%m%d_%H%M%S"))
+        st.session_state.last_out_root = out_root
+    if st.session_state.get("last_out_root") != out_root:
+        st.session_state.output_dir = ensure_dir(Path(out_root) / time.strftime("%Y%m%d_%H%M%S"))
+        st.session_state.last_out_root = out_root
 
     colX, colY, colZ = st.columns([1, 1, 1])
     with colX:
@@ -763,10 +722,8 @@ with st.sidebar:
 
     st.write(f"Session folder: `{st.session_state.output_dir}`")
 
-# Init API client
 client = init_openai_client(api_key_input)
 
-# Tabs
 tabs = st.tabs(["Single", "Multiple", "Remix", "Batch", "Assets"])
 
 # ---------- SINGLE ----------
@@ -779,7 +736,7 @@ with tabs[0]:
         st.caption("Upload multiple images to combine them into a single reference montage.")
         ref_uploaded = st.file_uploader("Or upload reference image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
-        est_cost = estimate_cost(1, seconds, model)
+        est_cost = estimate_cost(1, int(seconds), model)
         st.info(f"**Estimated cost:** ~${est_cost:.2f} • **API calls:** {1 + (1 if use_enhance else 0)}")
 
         if st.session_state.budget_enabled and (spent + est_cost) > st.session_state.budget_limit:
@@ -793,8 +750,7 @@ with tabs[0]:
                 st.stop()
 
             refs: List[Path] = []
-            
-            # Generate a reference from prompt if present
+
             if gen_refs_from_prompt.strip():
                 out_img = make_reference_image(
                     client, gen_refs_from_prompt,
@@ -805,7 +761,6 @@ with tabs[0]:
                     refs.append(out_img)
                     st.image(str(out_img), caption="Generated reference", use_container_width=True)
 
-            # Uploaded images
             if ref_uploaded:
                 refs_dir = ensure_dir(st.session_state.output_dir / "refs")
                 for i, uf in enumerate(ref_uploaded, start=1):
@@ -813,7 +768,6 @@ with tabs[0]:
                     write_bytes(p, uf.getvalue())
                     refs.append(p)
 
-            # Combine multiple refs into a single image
             single_ref_path = build_single_reference(
                 refs, st.session_state.output_dir, (canvas_w, canvas_h),
                 montage_layout=montage_layout,
@@ -856,7 +810,7 @@ with tabs[1]:
     workers = st.number_input("Concurrent workers", min_value=1, max_value=24, value=2, step=1)
     st.caption("Run up to 'Concurrent workers' jobs in parallel. Rate limiter controls API call pacing globally.")
 
-    m_est_cost = estimate_cost(int(n), seconds, model)
+    m_est_cost = estimate_cost(int(n), int(seconds), model)
     m_calls_per_job = 1 + (1 if use_enhance else 0)
     m_total_calls = int(n) * m_calls_per_job
     st.info(f"**Estimated cost:** ~${m_est_cost:.2f} • **Total API calls:** ~{m_total_calls}")
@@ -939,7 +893,7 @@ with tabs[2]:
         remix_prompts.append(st.text_input(f"Remix Prompt #{i+1}", key=f"remix_prompt_{i}", placeholder=f"Describe remix step {i+1}..."))
 
     r_videos = 1 + int(remix_count)
-    r_cost = estimate_cost(r_videos, seconds, model)
+    r_cost = estimate_cost(r_videos, int(seconds), model)
     st.info(f"**Estimated cost:** ~${r_cost:.2f} • **Clips:** {r_videos}")
 
     if st.session_state.budget_enabled and (spent + r_cost) > st.session_state.budget_limit:
@@ -1028,7 +982,6 @@ with tabs[3]:
             st.session_state.batch_jobs = []
             st.success("Cleared.")
 
-    # Shared references for batch
     st.write("Shared references for all queued jobs (optional)")
     b_gen_ref_prompt = st.text_input("Generate a shared reference image from prompt (optional)", key="batch_ref_gen")
     b_ref_uploaded = st.file_uploader("Or upload reference image(s) shared by all batch jobs", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="batch_ref_upload")
@@ -1038,12 +991,11 @@ with tabs[3]:
         for i, job in enumerate(st.session_state.batch_jobs):
             st.write(f"{i+1}. **{job['status'].upper()}** — {job['prompt'][:80]}{'...' if len(job['prompt'])>80 else ''}")
 
-    colBq1, colBq2 = st.columns([1, 1])
+    colBq1, _ = st.columns([1, 1])
     with colBq1:
         batch_enhance = st.checkbox("Enhance prompts in batch", value=False, key="batch_enhance")
 
     if client and st.button("Start queue run"):
-        # Build shared refs
         refs: List[Path] = []
         if b_gen_ref_prompt.strip():
             out_img = make_reference_image(
@@ -1079,8 +1031,7 @@ with tabs[3]:
             job["status"] = "running"
             st.write(f"Running: {job['prompt'][:80]}{'...' if len(job['prompt'])>80 else ''}")
 
-            # Budget check per job
-            j_est = estimate_cost(1, seconds, model)
+            j_est = estimate_cost(1, int(seconds), model)
             if st.session_state.budget_enabled and (st.session_state.spent_usd + j_est) > st.session_state.budget_limit:
                 job["status"] = "error"
                 st.error("Budget cap reached. Halting queue.")
