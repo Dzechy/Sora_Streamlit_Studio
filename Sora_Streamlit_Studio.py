@@ -4,10 +4,12 @@
 Sora Streamlit Studio — Budget, Rate-Limits, Batch Queue, Duration Slider
 
 Features:
- - Images API for generating reference images
+ - Images API for generating reference images (gpt-image-1)
  - Multiple reference image uploads with automatic montage combining
  - Configurable montage layout (Auto, 1×N, N×1, 2×2, 3×2, 3×3, 3×N, Custom)
  - Row-wise, top-aligned prompt inputs for multi-generation
+ - Safer reference upload: passes an open file handle to the Videos API
+ - Improved polling: refreshes status and progress from retrieve()
 """
 import os
 import io
@@ -246,20 +248,18 @@ def poll_and_download_video(
     ph = st.empty()
     bar = st.progress(0)
 
-    def clamp01(x: float) -> float:
-        return max(0.0, min(1.0, x))
-
     while status not in ("completed", "failed", "cancelled"):
-        progress = getattr(video, "progress", progress) or progress
-        status = getattr(video, "status", status)
-        bar.progress(int(max(0, min(100, progress))))
-        ph.info(f"Status: {status} • {int(max(0, min(100, progress)))}%")
-        time.sleep(1.0)
         try:
             video = client.videos.retrieve(video.id)
             status = getattr(video, "status", status)
+            progress = getattr(video, "progress", progress) or progress
         except Exception:
+            # keep last known values
             pass
+        pct = int(max(0, min(100, progress)))
+        bar.progress(pct)
+        ph.info(f"Status: {status} • {pct}%")
+        time.sleep(1.0)
 
     if getattr(video, "status", "failed") == "failed":
         err = getattr(getattr(video, "error", None), "message", "Video generation failed")
@@ -312,10 +312,11 @@ def make_reference_image(
     name: str,
     canvas_size: Tuple[int, int] = (720, 1280)
 ) -> Optional[Path]:
+    """Generate a square image then letterbox to target canvas."""
     try:
         resp = call_api_with_rl(
             lambda: client.images.generate(
-                model="dall-e-3",
+                model="gpt-image-1",       # patched from "dall-e-3"
                 prompt=text,
                 size="1024x1024",
                 response_format="b64_json"
@@ -463,7 +464,14 @@ class GenJob:
     references: Optional[List[Path]] = None
     result_path: Optional[Path] = None
 
-def _video_create(client: OpenAI, kwargs: Dict[str, Any]):
+def _create_video_with_optional_ref(client: OpenAI, *, model: str, prompt: str,
+                                    size: str, seconds: int, ref_path: Optional[Path]):
+    """Create a video, safely passing a single reference as an open file handle if present."""
+    kwargs: Dict[str, Any] = dict(model=model, prompt=prompt, size=size, seconds=int(seconds))
+    if ref_path and ref_path.exists():
+        with ref_path.open("rb") as f:
+            kwargs["input_reference"] = f  # adjust key if your account uses a different name
+            return call_api_with_rl(lambda: client.videos.create(**kwargs))
     return call_api_with_rl(lambda: client.videos.create(**kwargs))
 
 def generate_single(
@@ -474,12 +482,8 @@ def generate_single(
     references: Optional[List[Path]],
     model: str
 ) -> Optional[Path]:
-    kwargs = dict(model=model, prompt=prompt, size=size, seconds=int(seconds))
-    if references:
-        r0 = Path(references[0])
-        if r0.exists():
-            kwargs["input_reference"] = str(r0)
-    vid = _video_create(client, kwargs)
+    ref_path = Path(references[0]) if references else None
+    vid = _create_video_with_optional_ref(client, model=model, prompt=prompt, size=size, seconds=seconds, ref_path=ref_path)
     path, _ = poll_and_download_video(client, vid, st.session_state.output_dir, "single", seconds, model)
     return path
 
@@ -493,12 +497,8 @@ def generate_and_remix(
     model: str
 ) -> List[Optional[Path]]:
     outputs: List[Optional[Path]] = []
-    base_kwargs = dict(model=model, prompt=base_prompt, size=size, seconds=int(seconds))
-    if references:
-        r0 = Path(references[0])
-        if r0.exists():
-            base_kwargs["input_reference"] = str(r0)
-    base = _video_create(client, base_kwargs)
+    ref_path = Path(references[0]) if references else None
+    base = _create_video_with_optional_ref(client, model=model, prompt=base_prompt, size=size, seconds=seconds, ref_path=ref_path)
     base_path, _ = poll_and_download_video(client, base, st.session_state.output_dir, "remix_base", seconds, model)
     outputs.append(base_path)
 
@@ -522,13 +522,13 @@ def generate_multiple(
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def worker(job: GenJob):
-        kwargs = dict(model=model, prompt=(job.enhanced_prompt or job.prompt), size=size, seconds=int(seconds))
-        if job.references:
-            r0 = Path(job.references[0])
-            if r0.exists():
-                kwargs["input_reference"] = str(r0)
+        ref_path = Path(job.references[0]) if job.references else None
         try:
-            vid = _video_create(client, kwargs)
+            vid = _create_video_with_optional_ref(
+                client, model=model,
+                prompt=(job.enhanced_prompt or job.prompt),
+                size=size, seconds=seconds, ref_path=ref_path
+            )
             out_path, _ = poll_and_download_video(client, vid, st.session_state.output_dir, f"multi_{job.idx+1}", seconds, model)
             return job.idx, out_path
         except Exception as e:
