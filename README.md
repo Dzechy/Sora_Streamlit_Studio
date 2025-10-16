@@ -1,6 +1,6 @@
 # Sora Streamlit Studio
 
-_An end-to-end Streamlit app for creating watermark-free videos with OpenAI’s Sora API — featuring reference images, prompt enhancement, single/multiple/concurrent generation, remix sequences, a rate-limit aware batch queue, and budget guardrails with a live “remaining budget” meter. It also includes download buttons for generated assets, optional FFmpeg stitching for multi-clip sequences, and one-click zip export of your session outputs._
+*An end-to-end Streamlit app for creating watermark-free videos with OpenAI’s Sora API — featuring reference images, prompt enhancement, single/multiple/concurrent generation, remix sequences, a rate-limit aware batch queue, and budget guardrails with a live “remaining budget” meter. It also includes download buttons for generated assets, optional FFmpeg stitching for multi-clip sequences, and one-click zip export of your session outputs.*
 
 **Heads-up:** The app is designed to be future-compatible. It uses a duration slider (1–60s) and a “Strict supported durations” toggle. When strict mode is on, your choice snaps to currently supported values (e.g., 4/8/12) to avoid API errors. You can turn strict mode off to try new durations as they become available.
 
@@ -42,12 +42,14 @@ _An end-to-end Streamlit app for creating watermark-free videos with OpenAI’s 
 - **Reference images:**
   - Upload one or more images.
   - Or generate a reference image from a text prompt (uses an image model).
+  - **Automatic montage combining** — upload multiple images and combine them into a single reference with configurable layouts (Auto, 1×N, N×1, 2×2, 3×2, 3×3, 3×N, Custom).
 - **Prompt enhancement (optional)** with before/after display:
   - Styles: `director`, `pixar`, `clean`.
 - **Single generation flow.**
 - **Multiple generation flow with concurrency:**
   - Choose N jobs and workers.
   - Jobs run in parallel (threaded) and are still gated by a global rate limiter.
+  - Row-wise, top-aligned prompt inputs for better UX.
 - **Remix flow:**
   - Create a base clip, then apply N remix prompts sequentially.
   - Optional FFmpeg stitch into one MP4.
@@ -188,6 +190,12 @@ docker run -it --rm -p 8501:8501 -e OPENAI_API_KEY=sk-... sora-studio
 
 - Toggle on/off and pick a style: `director`, `pixar`, `clean`.
 
+**Reference Montage**
+
+- **Montage layout:** Choose from Auto, 1×N (vertical stack), N×1 (horizontal strip), 2×2 grid, 3×2 grid, 3×3 grid, 3×N (3 cols, rows as needed), or Custom.
+- **Padding:** Set spacing between images in pixels.
+- **Custom columns/rows:** For Custom layout, specify exact grid dimensions.
+
 **Budget**
 
 - Optional budget cap for the session, with live meter (spent / cap / remaining).
@@ -203,7 +211,7 @@ docker run -it --rm -p 8501:8501 -e OPENAI_API_KEY=sk-... sora-studio
 ### Single tab
 
 - Enter a video prompt.
-- Optionally generate a reference image from text or upload your own reference images.
+- Optionally generate a reference image from text or **upload multiple reference images** to automatically combine them into a single montage.
 - Optional prompt enhancement, with the enhanced version shown after generation.
 - Estimated cost and API calls are shown before you run.
 - On success, you’ll see a preview, download button, and (if used) the enhanced prompt.
@@ -213,8 +221,8 @@ docker run -it --rm -p 8501:8501 -e OPENAI_API_KEY=sk-... sora-studio
 ### Multiple tab
 
 - Specify N generations and Concurrent workers.
-- Provide N prompts; the app runs them in parallel (thread pool).
-- Optional shared reference image(s) (prompt-generated or uploaded).
+- Provide N prompts using **row-wise, top-aligned prompt inputs** for easier editing.
+- Optional shared reference image(s) (prompt-generated or uploaded, with automatic montage support).
 - Optional enhancement per prompt; enhanced text appears with each result.
 - Shows total estimated cost and total API calls up front.
 - Global rate limiter still gates the calls to reduce 429s.
@@ -224,7 +232,7 @@ docker run -it --rm -p 8501:8501 -e OPENAI_API_KEY=sk-... sora-studio
 ### Remix tab
 
 - Enter a **Base Shot Prompt** and a number of remix steps.
-- Optional base reference images (prompt-generated or uploaded).
+- Optional base reference images (prompt-generated or uploaded, with automatic montage support).
 - Optional prompt enhancement (applies to base + each remix).
 - Returns each clip with a download button.
 - If FFmpeg is installed, you can stitch all the clips into one MP4.
@@ -238,7 +246,7 @@ docker run -it --rm -p 8501:8501 -e OPENAI_API_KEY=sk-... sora-studio
   - A token-bucket rate limiter paces API calls based on your RPM tier.
   - The scheduler auto-pauses when tokens run out and resumes when the minute window resets — no manual retry needed.
 - You can enable prompt enhancement for the entire queue.
-- Supply shared references for all batch jobs (generated or uploaded).
+- Supply shared references for all batch jobs (generated or uploaded, with automatic montage support).
 - The queue stops early if your budget cap would be exceeded by the next job.
 
 -----
@@ -274,7 +282,15 @@ You can either:
 - **Upload** one or more images (PNG/JPG), or
 - **Generate** a reference image from a short text prompt (uses an image model under the hood). The app saves it to your session’s `refs` folder and shows a preview.
 
-When generating a video, the app passes the first reference image to the Sora API (the parameter name can vary across SDK versions; this app uses a commonly supported approach).
+**Multiple images are automatically combined** into a single reference montage using configurable layouts:
+
+- **Auto:** Intelligently chooses grid layout based on image count
+- **1×N / N×1:** Vertical stack or horizontal strip
+- **2×2 / 3×2 / 3×3:** Fixed grid layouts
+- **3×N:** 3 columns with rows as needed
+- **Custom:** Specify exact columns and rows
+
+When generating a video, the app passes the combined reference image to the Sora API.
 
 -----
 
@@ -311,6 +327,8 @@ Install FFmpeg (see [Requirements](#requirements)) and you’ll see a “Stitch 
   - Install FFmpeg and restart the app; the stitch controls will appear.
 - **OpenAI SDK not installed**
   - `pip install openai` — also ensure `OPENAI_API_KEY` is set or paste it into the sidebar.
+- **Pillow not installed**
+  - `pip install pillow` — required for reference image montage combining and resizing.
 
 -----
 
@@ -335,6 +353,7 @@ You can also tweak:
 - Default model list
 - Retry counts / backoff behavior
 - Thread pool workers for multi-generation
+- Montage background color and padding defaults
 
 -----
 
@@ -352,6 +371,7 @@ You can also tweak:
 - Per-job model/duration in Multi & Batch tabs
 - Per-clip cost breakdown & CSV export
 - Persistent job history across sessions
+- Advanced montage options (custom backgrounds, borders, captions)
 
 -----
 
@@ -381,5 +401,6 @@ If this saved you time (or a shoot 👀), you can fuel more dev with a small tip
 
 Thanks a ton! 🙏
 
+-----
 
 **Happy creating ✨**
