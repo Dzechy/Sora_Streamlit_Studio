@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Sora Streamlit Studio — Budget, Rate-Limits, Batch Queue, Duration Slider
-(Contains the Multiple tab "first fix": row-wise, top-aligned prompt inputs)
 """
 import os
 import io
@@ -371,7 +370,7 @@ def stitch_videos(files: List[Path], out_path: Path) -> Optional[Path]:
         return None
 
 # -------------------------
-# UI Helper — Multiple tab "first fix"
+# UI Helper — Multiple tab
 # -------------------------
 
 def render_multi_prompt_inputs(
