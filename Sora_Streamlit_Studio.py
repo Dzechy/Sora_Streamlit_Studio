@@ -179,7 +179,7 @@ def init_openai_client(api_key: Optional[str]) -> Optional[OpenAI]:
         return None
     key = api_key or os.getenv("OPENAI_API_KEY", "")
     if not key:
-        st.warning("Provide an OpenAI API key in the sidebar.")
+        # Sidebar already shows a warning; we'll also add a banner in the main area below.
         return None
     os.environ["OPENAI_API_KEY"] = key
     try:
@@ -254,7 +254,6 @@ def poll_and_download_video(
             status = getattr(video, "status", status)
             progress = getattr(video, "progress", progress) or progress
         except Exception:
-            # keep last known values
             pass
         pct = int(max(0, min(100, progress)))
         bar.progress(pct)
@@ -316,7 +315,7 @@ def make_reference_image(
     try:
         resp = call_api_with_rl(
             lambda: client.images.generate(
-                model="gpt-image-1",       # patched from "dall-e-3"
+                model="gpt-image-1",
                 prompt=text,
                 size="1024x1024",
                 response_format="b64_json"
@@ -628,6 +627,8 @@ st.caption("Web UI for Sora video generation with prompt enhancement, references
 with st.sidebar:
     st.header("API & Limits")
     api_key_input = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    if not api_key_input and not os.getenv("OPENAI_API_KEY"):
+        st.warning("Provide an OpenAI API key here to enable image & video generation.", icon="⚠️")
     model = st.selectbox("Sora Model", ["sora-2", "sora-2-pro"], index=0)
 
     seconds_slider = st.slider("Duration (seconds)", min_value=1, max_value=60, value=4, step=1)
@@ -649,7 +650,7 @@ with st.sidebar:
     enhance_style = st.selectbox("Enhancement style", ["director", "pixar", "clean"], index=0)
 
     st.subheader("Reference Montage")
-    st.caption("Combine multiple uploaded images into one reference using these settings.")
+    st.caption("Combine multiple uploaded images into a single reference. Sora currently accepts only one reference per job; the app makes a contact sheet (according to these settings).")
     montage_layout = st.selectbox(
         "Montage layout",
         ["Auto", "1×N (vertical stack)", "N×1 (horizontal strip)", "2×2 grid", "3×2 grid", "3×3 grid", "3×N (3 cols, rows as needed)", "Custom"],
@@ -722,7 +723,11 @@ with st.sidebar:
 
     st.write(f"Session folder: `{st.session_state.output_dir}`")
 
-client = init_openai_client(api_key_input)
+# Sticky banner in main area if API key is missing
+if not (os.getenv("OPENAI_API_KEY") or st.session_state.get("OPENAI_API_KEY") or (locals().get("api_key_input") or "")):
+    st.warning("🔑 Add your OpenAI API key in the left sidebar to enable image & video generation. The rest of the UI is still interactive for configuration.", icon="🔑")
+
+client = init_openai_client(locals().get("api_key_input"))
 
 tabs = st.tabs(["Single", "Multiple", "Remix", "Batch", "Assets"])
 
@@ -733,8 +738,11 @@ with tabs[0]:
     with colA:
         user_prompt = st.text_area("Prompt", height=150, placeholder="Describe your video...")
         gen_refs_from_prompt = st.text_input("Optional: Generate reference image from a prompt (leave blank to skip)")
-        st.caption("Upload multiple images to combine them into a single reference montage.")
-        ref_uploaded = st.file_uploader("Or upload reference image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+        st.caption("Tip: You can upload multiple images below; we’ll combine them into one montage based on the **Reference Montage** settings in the sidebar.")
+        ref_uploaded = st.file_uploader("Upload reference image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+        # Small text right under uploader
+        st.caption(("Multiple uploads are supported. Sora accepts only one reference—this app merges your uploads into a single image. "
+                    + ("Without Pillow installed, only the first image will be used." if not PILLOW_AVAILABLE else "")))
 
         est_cost = estimate_cost(1, int(seconds), model)
         st.info(f"**Estimated cost:** ~${est_cost:.2f} • **API calls:** {1 + (1 if use_enhance else 0)}")
@@ -822,8 +830,12 @@ with tabs[1]:
     multi_prompts: List[str] = render_multi_prompt_inputs(int(n))
 
     st.write("References (optional)")
+    st.caption("Tip: You can upload multiple reference images to be shared by all jobs; they’ll be combined into a single montage according to the **Reference Montage** settings.")
     m_gen_ref_prompt = st.text_input("Generate a shared reference image from prompt (optional)", key="multi_ref_gen")
-    m_ref_uploaded = st.file_uploader("Or upload reference image(s) shared by all jobs", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="multi_ref_upload")
+    m_ref_uploaded = st.file_uploader("Upload shared reference image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="multi_ref_upload")
+    # Small text right under uploader
+    st.caption(("Multiple uploads are supported. A single merged reference is sent to each job. "
+                + ("Without Pillow installed, only the first image will be used." if not PILLOW_AVAILABLE else "")))
 
     if client and st.button("Generate All"):
         if st.session_state.budget_enabled and (spent + m_est_cost) > st.session_state.budget_limit:
@@ -899,8 +911,12 @@ with tabs[2]:
     if st.session_state.budget_enabled and (spent + r_cost) > st.session_state.budget_limit:
         st.warning(f"This remix run (~${r_cost:.2f}) may exceed your remaining budget.")
 
-    rr_gen_refs_from_prompt = st.text_input("Optional: Generate reference image from a prompt (for base shot)")
-    rr_ref_uploaded = st.file_uploader("Or upload reference image(s) for base shot", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="remix_refs")
+    st.caption("Tip: Upload multiple images to define the base shot’s look; we’ll merge them into one reference using the **Reference Montage** settings.")
+    rr_gen_refs_from_prompt = st.text_input("Generate a reference image from a prompt (for base shot)")
+    rr_ref_uploaded = st.file_uploader("Upload reference image(s) for base shot", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="remix_refs")
+    # Small text right under uploader
+    st.caption(("Multiple uploads are supported. Only a single merged reference is used for the base shot. "
+                + ("Without Pillow installed, only the first image will be used." if not PILLOW_AVAILABLE else "")))
 
     if client and st.button("Generate Remix Sequence"):
         if st.session_state.budget_enabled and (spent + r_cost) > st.session_state.budget_limit:
@@ -983,8 +999,12 @@ with tabs[3]:
             st.success("Cleared.")
 
     st.write("Shared references for all queued jobs (optional)")
+    st.caption("Tip: Upload multiple images to guide the batch; we’ll merge them into one reference according to **Reference Montage**.")
     b_gen_ref_prompt = st.text_input("Generate a shared reference image from prompt (optional)", key="batch_ref_gen")
-    b_ref_uploaded = st.file_uploader("Or upload reference image(s) shared by all batch jobs", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="batch_ref_upload")
+    b_ref_uploaded = st.file_uploader("Upload shared reference image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="batch_ref_upload")
+    # Small text right under uploader
+    st.caption(("Multiple uploads are supported. One merged reference is used for each batch job. "
+                + ("Without Pillow installed, only the first image will be used." if not PILLOW_AVAILABLE else "")))
 
     if st.session_state.batch_jobs:
         st.write("Current queue:")
