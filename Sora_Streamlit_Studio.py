@@ -734,7 +734,7 @@ with tabs[0]:
         gen_refs_from_prompt = st.text_input("Optional: Generate reference image from a prompt (leave blank to skip)")
         ref_uploaded = st.file_uploader("Or upload reference image(s)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         # NEW helper text:
-        st.caption("You can upload multiple images. They will be combined into a single reference montage based on the 'Reference Montage' settings in the sidebar. If capacity is exceeded, only the first K images are used. If Pillow isn’t installed, only the first image is used.")
+        st.caption("You can upload multiple images. They will be combined into a single reference montage based on the 'Reference Montage' settings in the sidebar. If capacity is exceeded, the extras are ignored. If Pillow isn’t installed, only the first image is used.")
 
         est_cost = estimate_cost(1, int(seconds), model)
         st.info(f"**Estimated cost:** ~${est_cost:.2f} • **API calls:** {1 + (1 if use_enhance else 0)}")
