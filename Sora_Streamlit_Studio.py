@@ -825,7 +825,7 @@ with tabs[1]:
     m_gen_ref_prompt = st.text_input("Generate a shared reference image from prompt (optional)", key="multi_ref_gen")
     m_ref_uploaded = st.file_uploader("Or upload reference image(s) shared by all jobs", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="multi_ref_upload")
     # NEW helper text:
-    st.caption("Multiple uploads will be combined into a single shared reference montage (sidebar settings apply). If more images are uploaded than the grid can hold, the first K are used. Without Pillow, only the first image is used.")
+    st.caption("Multiple uploads will be combined into a single shared reference montage (sidebar settings apply). If more images are uploaded than the grid can hold, the extras are ignored. Without Pillow, only the first image is used.")
 
     if client and st.button("Generate All"):
         if st.session_state.budget_enabled and (spent + m_est_cost) > st.session_state.budget_limit:
