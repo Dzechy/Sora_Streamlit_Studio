@@ -4,7 +4,7 @@
 
 **Heads-up:** The app is designed to be future-compatible. It uses a duration slider (1–60s) and a “Strict supported durations” toggle. When strict mode is on, your choice snaps to currently supported values (e.g., 4/8/12) to avoid API errors. You can turn strict mode off to try new durations as they become available.
 
-[Try it out](sorastreamstudio.streamlit.app)
+https://sorastreamstudio.streamlit.app
 -----
 
 ## Table of Contents
